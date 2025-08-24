@@ -1,4 +1,4 @@
-![](snapline_v1.png)
+![](resources/snapline_v1.png)
 
 Prompt theme for Windows+cmd+Clink focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
 
@@ -26,20 +26,25 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * no-repo in white
   * in-progress action glyph in yellow for
 
-![](snapline_legend.png)
+![](resources/action_legend.png)
 
   * status
-    * conflicted 🗲N
-    * ahead      ⇡N
-    * behind     ⇣N
-    * diverged   ⇕⇡A⇣B'
-    * tracked    ?
-    * stashed    ≡N
-    * modified   !N
-    * staged     +N
-    * renamed    »N
-    * deleted    XN
-    * untracked  ??
+
+![](resources/status_legend.png)
+
+## Examples
+
+* on dirty branch 'heureka', dir is clean, 1 file modified, 1 new file, 2 stash items
+
+![](resources/ex-1.png)
+
+* active virtual environment 'env1', branch and dir are clean, branch is 1 commit ahead and 2 behind the origin
+
+![](resources/ex-2.png)
+
+* active virtual environment 'env1', branch 'feat1' in dirty state, merge action in progress, dir is clean, 1 conflicted file, 1 new file
+
+![](resources/ex-3.png)
 
 ## Installation
 
