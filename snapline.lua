@@ -65,9 +65,9 @@ local config = {
 -- print()
 -- 
 -- print("int rebase      Ri        rebase merge  Rm")
--- print("rebase          \239\129\162         am            \238\172\156")
--- print("am_rebase       amR       merging       \243\176\189\156")
--- print("cherry_picking  \238\138\155         reverting     \239\129\160")
+-- print("rebase          \239\129\162         mail split    \238\172\156")
+-- print("mail s. rebase  amR       merging       \243\176\189\156")
+-- print("cherry-picking  \238\138\155         reverting     \239\129\160")
 -- print("bisecting       \243\176\135\148")
 -- print()
 -- print()
