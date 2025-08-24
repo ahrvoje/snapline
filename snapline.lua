@@ -8,18 +8,17 @@
 -- cached values used for fast prompt render to keep CLI snappy
 -- every use of cached value is refreshed upon async op finish
 local _cache = { cwd = '', git_render = '', dirty_branch = nil, dirty_dir = nil, length = nil, offset = 0 }
--- Invalidate cache when directory changes
-if clink and clink.onbeginedit then
-    clink.onbeginedit(function ()
-        local cwd = os.getenv('CD') or ''
-        if cwd ~= _cache.cwd then
-            _cache.cwd, _cache.git_render, _cache.dirty_branch, _cache.dirty_dir, _cache.length, offset = cwd, '', nil, nil, nil, 0
-        end
-    end)
-end
+-- invalidate cache on dir change
+clink.onbeginedit(function ()
+    local cwd = os.getenv('CD') or ''
+    if cwd ~= _cache.cwd then
+        _cache.cwd, _cache.git_render, _cache.dirty_branch, _cache.dirty_dir, _cache.length, _cache.offset = cwd, '', nil, nil, nil, 0
+    end
+end)
 
 local config = {
     branch_symbol = '\238\130\160',       -- UTF-8 code for branch glyph
+    color_venv  = '\x1b[33m',             -- yellow
     color_state = '\x1b[33m',             -- yellow
     color_clean = '\x1b[32m',             -- green
     color_dirty = '\x1b[38;2;200;90;90m', -- red
@@ -56,19 +55,19 @@ local config = {
     profile = false,
 }
 
--- print("diverged  ⇕          ahead       ⇡")
--- print("behind    ⇣          conflicted  \243\177\144\139")
--- print("staged    +          modified    !")
--- print("renamed   »          deleted     X")
--- print("tracked   ?          untracked   ??")
--- print("stashed   ≡")
+-- print('diverged  ⇕          ahead       ⇡')
+-- print('behind    ⇣          conflicted  \243\177\144\139')
+-- print('staged    +          modified    !')
+-- print('renamed   »          deleted     X')
+-- print('tracked   ?          untracked   ??')
+-- print('stashed   ≡')
 -- print()
 -- 
--- print("int rebase      Ri        rebase merge  Rm")
--- print("rebase          \239\129\162         mail split    \238\172\156")
--- print("mail s. rebase  amR       merging       \243\176\189\156")
--- print("cherry-picking  \238\138\155         reverting     \239\129\160")
--- print("bisecting       \243\176\135\148")
+-- print('int rebase      Ri        rebase merge  Rm')
+-- print('rebase          \239\129\162         mail split    \238\172\156')
+-- print('mail s. rebase  amR       merging       \243\176\189\156')
+-- print('cherry-picking  \238\138\155         reverting     \239\129\160')
+-- print('bisecting       \243\176\135\148')
 -- print()
 -- print()
 
@@ -90,6 +89,27 @@ end
 function prettyprint(x, rl_buffer)
     if rl_buffer and rl_buffer.beginoutput then rl_buffer:beginoutput() end
     (clink and clink.print or print)(type(x)=='table' and pp(x) or tostring(x))
+end
+
+-- extract venv name from env vars
+local function venv_name()
+    local v = os.getenv('VIRTUAL_ENV')
+    if v and #v > 0 then return path.getbasename(v) end
+
+    -- conda
+    local cpm = os.getenv('CONDA_PROMPT_MODIFIER')
+    if cpm and #cpm > 0 then
+        local s = cpm:gsub('^%s*%(', ''):gsub('%)%s*$', '')
+        if #s > 0 then return s end
+    end
+    local c = os.getenv('CONDA_DEFAULT_ENV')
+    if c and #c > 0 then return c end
+
+    -- python
+    local pv = os.getenv('PYENV_VERSION')
+    if pv and #pv > 0 then return pv end
+
+    return nil
 end
 
 -- git status table using Clink's git API
@@ -237,8 +257,8 @@ if clink and clink.onendedit then
     end)
 end
 
-local function folder_name()
-    local cwd = os.getcwd() or ''
+local function dir_name()
+    local cwd = os.getenv('CD') or ''
     local base = path.getbasename(cwd)
     if base and #base > 0 then return base end
     -- at drive root give readable name, e.g. for 'C:\' give 'C:'
@@ -256,8 +276,8 @@ local function profile()
     return response
 end
 
-local function format_git_prompt()
-    local git_prompt = ''
+local function git_left_prompt()
+    local prompt = ''
 
     local branch = git.getbranch()
     if branch then
@@ -265,7 +285,7 @@ local function format_git_prompt()
         if _cache.dirty_branch ~= nil then
             branch_color = _cache.dirty_branch and config.color_dirty or config.color_clean
         end
-        git_prompt = branch_color .. config.branch_symbol .. branch .. ' ' .. config.color_reset
+        prompt = branch_color .. config.branch_symbol .. branch .. ' ' .. config.color_reset
     end
     
     -- https://github.com/chrisant996/clink/blob/master/clink/app/scripts/git.lua#L732
@@ -273,10 +293,10 @@ local function format_git_prompt()
     local action = git.getaction()
     if action then
         action_key = action:gsub('-', '_'):gsub('/', '_')
-        git_prompt = git_prompt .. config.color_state .. config.action_symbol[action_key] .. ' ' .. config.color_reset
+        prompt = prompt .. config.color_state .. config.action_symbol[action_key] .. ' ' .. config.color_reset
     end
     
-    return git_prompt
+    return prompt
 end
 
 local pf = clink.promptfilter(300)
@@ -297,7 +317,11 @@ function pf:filter(prompt)
         dir_color = _cache.dirty_dir and config.color_dirty or config.color_clean
     end
 
-    prompt = format_git_prompt() .. dir_color .. folder_name() .. config.color_reset .. ' > '
+    venv = venv_name()
+    prompt = venv and (config.color_venv .. '{' .. venv_name() .. '} ') or ''
+    prompt = prompt .. git_left_prompt()
+    prompt = prompt .. dir_color .. dir_name() .. ' '
+    prompt = prompt .. config.color_reset .. '> '
     
     if not _cache.length then
         _cache.length = #prompt
