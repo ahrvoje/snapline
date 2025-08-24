@@ -16,8 +16,8 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * clean in green
     * dirty in red (untracked files found)
 ### Right prompt
-  * git status
-  * clock of last executed command
+  * git status glyphs
+  * duration of the last executed command
   * current time
 ## git
   * branch
@@ -35,17 +35,14 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
 ## Examples
 
 * on dirty branch 'heureka', dir is clean, 1 file modified, 1 new file, 2 stash items
-
 ![](resources/ex-1.png)
 
 * active virtual environment 'env1', branch and dir are clean, branch is 1 commit ahead and 2 behind the origin
-
 ![](resources/ex-2.png)
 
-* active virtual environment 'env1', branch 'feat1' in dirty state, merge action in progress, dir is clean, 1 conflicted file, 1 new file
-
+* virtual env 'env1', branch 'feat1' in dirty state, merge action in progress, dir is clean, 1 conflicted file, 1 new file
 ![](resources/ex-3.png)
 
 ## Installation
 
-Copy ```.lua``` file into Clink configuration folder. Ensure terminal uses Nerd Fonts.
+Copy the ```.lua``` file into Clink configuration folder. Ensure terminal uses Nerd Fonts.
