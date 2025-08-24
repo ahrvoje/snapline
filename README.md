@@ -24,6 +24,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * dirty in red
     * no-repo in white
   * in-progress action glyph in yellow for
+
 ![](snapline_legend.png)
   * status
     * conflicted |N
