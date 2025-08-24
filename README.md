@@ -11,10 +11,10 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
   * virtual environment
   * git branch
   * git in-progress action
-  * currwnt working directory
+  * current working directory
     * no-repo in white
     * clean in green
-    * dirty in red (untracked files found(
+    * dirty in red (untracked files found)
   * git status
   * clock of last executed command
   * current time
