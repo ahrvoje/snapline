@@ -53,7 +53,7 @@ local config = {
         reverting      = '\239\129\160',
         bisecting      = '\243\176\135\148',
     },
-    profile = true,
+    profile = false,
 }
 
 -- print("diverged  ⇕          ahead       ⇡")
