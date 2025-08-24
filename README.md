@@ -1,6 +1,6 @@
 ![](resources/snapline_v1.png)
 
-Prompt theme for Windows+cmd+![Clink](https://github.com/chrisant996/clink) focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
+Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
 
 ## Speed
   * Use only sub-millisecond calls to render the prompt.
