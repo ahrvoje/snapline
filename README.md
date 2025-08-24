@@ -8,7 +8,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
   * Async all delays so editing is never blocked.
   * Cache last results so info is always present.
 * ## Info
-  * virtual environment
+  * virtual environment in yellow
   * git branch
   * git in-progress action
   * current working directory
@@ -24,15 +24,15 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * dirty in red
     * no-repo in white
   * in-progress action glyph in yellow for
-    * interactive rebase
-    * rebase merge
-    * rebase
-    * mail split
-    * mail split rebase
-    * merging
-    * cherry-picking
-    * reverting
-    * bisecting
+    * interactive rebase Ri
+    * rebase merge Rm
+    * rebase 
+    * mail split 
+    * mail split rebase amR
+    * merging 󰽜
+    * cherry-picking 
+    * reverting 
+    * bisecting 󰇔
   * status
     * conflicted |N
     * ahead      ⇡N
