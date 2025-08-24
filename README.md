@@ -3,9 +3,9 @@
 Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
 
 ## Speed
-  * Use only sub-millisecond calls to render the prompt.
+  * Using only sub-millisecond calls to build the prompt.
   * Async all delays so editing is never blocked.
-  * Cache last results so info is always present.
+  * Cache last results so the content is always & instantly present.
 ## Info
 ### Left prompt
   * virtual environment in yellow
