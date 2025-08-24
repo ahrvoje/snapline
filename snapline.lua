@@ -53,7 +53,7 @@ local config = {
         reverting      = '\239\129\160',
         bisecting      = '\243\176\135\148',
     },
-    profile = false,
+    profile = true,
 }
 
 -- recursive walk and format Lua table
@@ -268,11 +268,11 @@ local pf = clink.promptfilter(300)
 function pf:filter(prompt)
     local response = clink.promptcoroutine(profile)
     if response then
-        _cache.git_render = git_render(response.info)
         _cache.dirty_branch = response.info.dirty_branch
         _cache.dirty_dir = response.info.dirty_dir
+        _cache.git_render = git_render(response.info)
         if config.profile then
-            _cache.git_render = tostring(response.duration) .. 's ' .. _cache.git_render
+            _cache.git_render = _rp_fmt_duration(response.duration) .. _cache.git_render
         end
     end
     
