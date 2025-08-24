@@ -7,6 +7,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
   * Async all delays so editing is never blocked.
   * Cache last results so info is always present.
 ## Info
+### Left prompt
   * virtual environment in yellow
   * git branch
   * git in-progress action
@@ -14,6 +15,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * no-repo in white
     * clean in green
     * dirty in red (untracked files found)
+### Right prompt
   * git status
   * clock of last executed command
   * current time
