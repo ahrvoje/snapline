@@ -28,7 +28,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
 ![](snapline_legend.png)
 
   * status
-    * conflicted |N
+    * conflicted 🗲N
     * ahead      ⇡N
     * behind     ⇣N
     * diverged   ⇕⇡A⇣B'
