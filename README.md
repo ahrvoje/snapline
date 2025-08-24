@@ -24,15 +24,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * dirty in red
     * no-repo in white
   * in-progress action glyph in yellow for
-    * interactive rebase Ri
-    * rebase merge Rm
-    * rebase 
-    * mail split 
-    * mail split rebase amR
-    * merging 󰽜
-    * cherry-picking 
-    * reverting 
-    * bisecting 󰇔
+![](snapline_legend.png)
   * status
     * conflicted |N
     * ahead      ⇡N
