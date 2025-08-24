@@ -56,6 +56,22 @@ local config = {
     profile = true,
 }
 
+-- print("diverged  ⇕          ahead       ⇡")
+-- print("behind    ⇣          conflicted  \243\177\144\139")
+-- print("staged    +          modified    !")
+-- print("renamed   »          deleted     X")
+-- print("tracked   ?          untracked   ??")
+-- print("stashed   ≡")
+-- print()
+-- 
+-- print("int rebase      Ri        rebase merge  Rm")
+-- print("rebase          \239\129\162         am            \238\172\156")
+-- print("am_rebase       amR       merging       \243\176\189\156")
+-- print("cherry_picking  \238\138\155         reverting     \239\129\160")
+-- print("bisecting       \243\176\135\148")
+-- print()
+-- print()
+
 -- recursive walk and format Lua table
 local function pp(t,i,s)
     i=i or '' s=s or {}
