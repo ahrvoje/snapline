@@ -25,9 +25,9 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) focus
     * dirty in red
     * no-repo in white
   * in-progress action legend
-    * <img src="resources/action_legend.png" width="720">
+<p align="center"><img src="resources/action_legend.png" width="720"></p>
   * status legend
-    * <img src="resources/status_legend.png" width="600">
+<p align="center"><img src="resources/status_legend.png" width="600"></p>
 
 ## Examples
 
