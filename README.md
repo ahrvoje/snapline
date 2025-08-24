@@ -1,6 +1,5 @@
 ![](snapline_v1.png)
 
-# snapline
 Prompt theme for Windows+cmd+Clink focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
 
 ## Speed
