@@ -39,3 +39,7 @@ Prompt theme for Windows+cmd+Clink focusing on speed and concise info using cach
     * renamed    »N
     * deleted    XN
     * untracked  ??
+
+## Installation
+
+Copy ```.lua``` file into Clink configuration folder. Ensure terminal uses Nerd Fonts.
