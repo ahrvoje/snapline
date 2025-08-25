@@ -7,12 +7,24 @@
 
 -- cached values used for fast prompt render to keep CLI snappy
 -- every use of cached value is refreshed upon async op finish
-local _cache = { cwd = '', git_render = '', dirty_branch = nil, dirty_dir = nil, length = nil, offset = 0 }
+local function get_init_cache()
+    return {
+        cwd = '',
+        git_render = '',
+        git_duration = '',
+        dirty_branch = nil,
+        dirty_dir = nil,
+        length = nil,
+        offset = 0,
+    }
+end
+local _cache = get_init_cache()
 -- invalidate cache on dir change
 clink.onbeginedit(function ()
     local cwd = os.getenv('CD') or ''
     if cwd ~= _cache.cwd then
-        _cache.cwd, _cache.git_render, _cache.dirty_branch, _cache.dirty_dir, _cache.length, _cache.offset = cwd, '', nil, nil, nil, 0
+        _cache = get_init_cache()
+        _cache.cwd = cwd
     end
 end)
 
@@ -55,6 +67,7 @@ local config = {
     profile = false,
 }
 
+-- print action and status
 -- print('diverged  ⇕          ahead       ⇡')
 -- print('behind    ⇣          conflicted  \243\177\144\139')
 -- print('staged    +          modified    !')
@@ -113,7 +126,27 @@ local function venv_name()
 end
 
 -- git status table using Clink's git API
+-- potentialy slow function in the focus of the entire story!
+-- typical benchmark times for a single call
+--
+--         no-repo dir                 repo dir
+--
+--         getaction   71µs            getaction   53µs
+--         getgitdir   71µs            getgitdir   8µs
+--          hasstash   74ms             hasstash   77ms   !!!
+--    getaheadbehind   76ms       getaheadbehind   78ms   !!!
+--         getremote   71µs            getremote   27µs
+--          isgitdir   23µs             isgitdir   8µs
+--         getbranch   70µs            getbranch   22µs
+--     getstashcount   73ms        getstashcount   75ms   !!!
+--      getcommondir   71µs         getcommondir   14µs
+--         getstatus   69µs            getstatus   86ms   !!!
+-- getconflictstatus   76ms    getconflictstatus   81ms   !!!
+--     getsystemname   71µs        getsystemname   9µs
+--
 local function collect_status()
+    if not git.isgitdir() then return nil end
+
     local info = {
         ahead        = 0,
         behind       = 0,
@@ -133,59 +166,47 @@ local function collect_status()
     
     --    arg1 = no_untracked, arg2 = include_submodules
     local status = git.getstatus(false, false)
+    -- prettyprint(status)
     
     if not status then
         info.dirty_branch  = nil
         info.dirty_dir = nil
-    else
-        -- prettyprint(status)
-        
-        -- overall dirty bit.
-        info.dirty_branch = status.dirty and true or false
-        
-        -- ahead/behind (numbers or nil)
-        info.ahead  = tonumber(status.ahead)  or 0
-        info.behind = tonumber(status.behind) or 0
-        
-        -- file counts
-        info.conflicted = status.conflict or 0
-        info.tracked    = status.tracked or 0
-        info.untracked  = status.untracked or 0
-        info.dirty_dir  = info.untracked > 0 or false
-        
-        -- working tree modifications
-        if status.working then
-            info.modified = status.working.modify or 0
-            -- also exists status.working.untracked
-        end
-        
-        -- staged changes; sum add/modify/delete/rename (copy is folded into rename)
-        if status.staged then
-            local s = 0
-            if status.staged.add    then s = s + status.staged.add    end
-            if status.staged.modify then s = s + status.staged.modify end
-            if status.staged.delete then s = s + status.staged.delete end
-            if status.staged.rename then s = s + status.staged.rename end
-            info.staged  = s
-            info.renamed = status.staged.rename or 0
-        end
-        
-        -- unique deletes across working+index
-        if status.total and status.total.delete then
-            info.deleted = status.total.delete
-        end
+        return info
+    end
+
+    -- overall dirty bit.
+    info.dirty_branch = status.dirty and true or false
+    
+    -- ahead/behind (numbers or nil)
+    info.ahead  = tonumber(status.ahead)  or 0
+    info.behind = tonumber(status.behind) or 0
+    
+    -- file counts
+    info.conflicted = status.conflict or 0
+    info.tracked    = status.tracked or 0
+    info.untracked  = status.untracked or 0
+    info.dirty_dir  = info.untracked > 0 or false
+    
+    -- working tree modifications
+    if status.working then
+        info.modified = status.working.modify or 0
+        -- also exists status.working.untracked
     end
     
-    local sc = git.getstashcount()
-    if sc then info.stash = sc end
+    -- staged changes; sum add/modify/delete/rename (copy is folded into rename)
+    if status.staged then
+        local s = 0
+        if status.staged.add    then s = s + status.staged.add    end
+        if status.staged.modify then s = s + status.staged.modify end
+        if status.staged.delete then s = s + status.staged.delete end
+        if status.staged.rename then s = s + status.staged.rename end
+        info.staged  = s
+        info.renamed = status.staged.rename or 0
+    end
     
-    -- if ahead/behind missing from getstatus(), fallback to getaheadbehind()
-    if (info.ahead == 0 and info.behind == 0) and status and (status.upstream ~= nil) then
-        local ahead, behind = git.getaheadbehind()
-        if ahead or behind then
-            info.ahead  = tonumber(ahead)  or info.ahead
-            info.behind = tonumber(behind) or info.behind
-        end
+    -- unique deletes across working+index
+    if status.total and status.total.delete then
+        info.deleted = status.total.delete
     end
         
     return info
@@ -278,7 +299,7 @@ end
 
 local function git_left_prompt()
     local prompt = ''
-
+    
     local branch = git.getbranch()
     if branch then
         local branch_color = config.color_reset
@@ -303,20 +324,20 @@ local pf = clink.promptfilter(300)
 -- left prompt, it is first in execution line so it contains the async part
 function pf:filter(prompt)
     local response = clink.promptcoroutine(profile)
-    if response then
+    if response and response.info then
         _cache.dirty_branch = response.info.dirty_branch
         _cache.dirty_dir = response.info.dirty_dir
         _cache.git_render = git_render(response.info)
-        if config.profile then
-            _cache.git_render = _rp_fmt_duration(response.duration) .. _cache.git_render
-        end
+    end
+    if config.profile and response and response.duration then
+        _cache.git_duration = _rp_fmt_duration(response.duration)
     end
     
     local dir_color = config.color_reset
     if _cache.dirty_dir ~= nil then
         dir_color = _cache.dirty_dir and config.color_dirty or config.color_clean
     end
-
+    
     venv = venv_name()
     prompt = venv and (config.color_venv .. '{' .. venv_name() .. '} ') or ''
     prompt = prompt .. git_left_prompt()
@@ -340,8 +361,43 @@ function pf:rightfilter()
     if _cache.git_render then
         prompt = _cache.git_render .. prompt
     end
-
+    
     -- if left prompt is async and shrinks after async op
     -- make sure right prompt it aligned by correct amount
-    return (' '):rep(_cache.offset) .. prompt
+    return _cache.git_duration .. ' ' .. (' '):rep(_cache.offset) .. prompt
 end
+
+-- benchmark clink git API calls
+-- local function time_loop(f)
+--     local duration = _now_s()
+--     for i = 1, 100 do
+--         _ = f()
+--     end
+--     return (_now_s() - duration) / 100
+-- end
+-- 
+-- local function bench()
+--     local funs = {
+--         {"getaction",         git.getaction},
+--         {"getgitdir",         git.getgitdir},
+--         {"hasstash",          git.hasstash},
+--         {"getaheadbehind",    git.getaheadbehind},
+--         {"getremote",         git.getremote},
+--         {"isgitdir",          git.isgitdir},
+--         {"getbranch",         git.getbranch},
+--         {"getstashcount",     git.getstashcount},
+--         {"getcommondir",      git.getcommondir},
+--         {"getstatus",         git.getstatus},
+--         {"getconflictstatus", git.getconflictstatus},
+--         {"getsystemname",     git.getsystemname},
+--     }
+--     for i = 1, #funs do
+--         duration = time_loop(funs[i][2])
+--         duration_color = duration>0.01 and config.color_dirty or config.color_clean
+--         print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
+--     end
+--     print()
+-- end
+-- clink.onbeginedit(function ()
+--     bench()
+-- end)
