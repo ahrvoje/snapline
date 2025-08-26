@@ -14,10 +14,6 @@ local function get_init_cache()
         git_duration = '',
         dirty_branch = nil,
         dirty_dir = nil,
-        length_left = nil,
-        length_right = nil,
-        offset_left = nil,
-        offset_right = nil,
     }
 end
 local _cache = get_init_cache()
@@ -365,16 +361,6 @@ function pf:filter()
     prompt = prompt .. git_left_prompt()
     prompt = prompt .. dir_color .. dir_name() .. ' '
     prompt = prompt .. config.color_reset .. '> '
-    if not response then
-        -- cache sync length of prompt so it can be used for offset after async finishes
-        _cache.length_left = #prompt
-        _cache.offset_left = nil
-    else        
-        -- if left prompt shrinks after async, i.e. new length is smaller
-        -- calculate and cache the offset to keep right prompt informed
-        o = _cache.length_left - #prompt
-        _cache.offset_left =  math.max(o, 0)
-    end
     
     return prompt
 end
@@ -387,19 +373,15 @@ function pf:rightfilter()
     stash_prompt = (stash_count>0) and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
 
     prompt = _cache.git_duration .. ' ' .. git_prompt .. stash_prompt .. right_prompt_time
-    if _cache.offset_left == nil then
-        _cache.length_right = #prompt
-        return prompt
-    else
-        -- if left prompt is async and shrinks after async op
-        -- make sure right prompt it aligned by correct amount
-        o = _cache.length_right - #prompt
-        _cache.offset_right = math.max(o, 0)
-        offset_total = _cache.offset_left + _cache.offset_right
-        return (' '):rep(offset_total) .. prompt
-    end
-end
 
+    return prompt
+end
+-- put clear line code before left prompt
+-- so line is cleared right before prompt render
+function pf:surround()
+    -- prefix, suffix, rprefix, rsuffix
+    return '\x1b[2K', '', '', ''
+end
 
 
 
@@ -433,18 +415,18 @@ end
 -- 
 -- local function bench()
 --     local funs = {
---         {"getaction",         git.getaction},
---         {"getgitdir",         git.getgitdir},
---         {"hasstash",          git.hasstash},
---         {"getaheadbehind",    git.getaheadbehind},
---         {"getremote",         git.getremote},
---         {"isgitdir",          git.isgitdir},
---         {"getbranch",         git.getbranch},
---         {"getstashcount",     git.getstashcount},
---         {"getcommondir",      git.getcommondir},
---         {"getstatus",         git.getstatus},
---         {"getconflictstatus", git.getconflictstatus},
---         {"getsystemname",     git.getsystemname},
+--         {'getaction',         git.getaction},
+--         {'getgitdir',         git.getgitdir},
+--         {'hasstash',          git.hasstash},
+--         {'getaheadbehind',    git.getaheadbehind},
+--         {'getremote',         git.getremote},
+--         {'isgitdir',          git.isgitdir},
+--         {'getbranch',         git.getbranch},
+--         {'getstashcount',     git.getstashcount},
+--         {'getcommondir',      git.getcommondir},
+--         {'getstatus',         git.getstatus},
+--         {'getconflictstatus', git.getconflictstatus},
+--         {'getsystemname',     git.getsystemname},
 --     }
 --     for i = 1, #funs do
 --         duration = time_loop(funs[i][2])
@@ -459,18 +441,18 @@ end
 -- benchmark alternative fast functions
 -- local function bench_alt()
 --     local funs = {
---         {"",              nil},
---         {"",              nil},
---         {"hasstash",      hasstash},
---         {"",              nil},
---         {"",              nil},
---         {"",              nil},
---         {"",              nil},
---         {"getstashcount", getstashcount},
---         {"",              nil},
---         {"",              nil},
---         {"",              nil},
---         {"",              nil},
+--         {'',              nil},
+--         {'',              nil},
+--         {'hasstash',      hasstash},
+--         {'',              nil},
+--         {'',              nil},
+--         {'',              nil},
+--         {'',              nil},
+--         {'getstashcount', getstashcount},
+--         {'',              nil},
+--         {'',              nil},
+--         {'',              nil},
+--         {'',              nil},
 --     }
 --     for i = 1, #funs do
 --         if not funs[i][2] then
