@@ -67,23 +67,6 @@ local config = {
     profile = false,
 }
 
--- print action and status
--- print('diverged  ⇕          ahead       ⇡')
--- print('behind    ⇣          conflicted  \243\177\144\139')
--- print('staged    +          modified    !')
--- print('renamed   »          deleted     X')
--- print('tracked   ?          untracked   ??')
--- print('stashed   ≡')
--- print()
--- 
--- print('int rebase      Ri        rebase merge  Rm')
--- print('rebase          \239\129\162         mail split    \238\172\156')
--- print('mail s. rebase  amR       merging       \243\176\189\156')
--- print('cherry-picking  \238\138\155         reverting     \239\129\160')
--- print('bisecting       \243\176\135\148')
--- print()
--- print()
-
 -- recursive walk and format Lua table
 local function pp(t,i,s)
     i=i or '' s=s or {}
@@ -123,6 +106,28 @@ local function venv_name()
     if pv and #pv > 0 then return pv end
 
     return nil
+end
+
+-- fast stash count based on counting .git\logs\refs\stash lines
+local function getstashcount()
+    local gd = git.getgitdir()
+    if not gd then return 0 end
+    
+    local f = io.open(gd..'\\logs\\refs\\stash', 'r')
+    if not f then return 0 end
+    
+    stash = f:read('*a')
+    f:close()
+    if not stash then return 0 end
+  
+    stash_count = 0
+    for i = 1, #stash do
+        if string.sub(stash, i, i) == '\n' then
+            stash_count = stash_count + 1
+        end
+    end
+  
+    return stash_count
 end
 
 -- git status table using Clink's git API
@@ -208,6 +213,8 @@ local function collect_status()
     if status.total and status.total.delete then
         info.deleted = status.total.delete
     end
+    
+    info.stash = getstashcount()
         
     return info
 end
@@ -236,8 +243,9 @@ end
 
 local strfmt, floor = string.format, os.date, math.floor
 local function _rp_fmt_duration(s)
-    if not s or s < 1e-6 then return '' end
+    if not s or s < 1e-9 then return '' end
     
+    if s < 1e-6 then return strfmt('%.0fns', s*1000000000) end
     if s < 1e-3 then return strfmt('%.0fµs', s*1000000) end
     if s < 1    then return strfmt('%.0fms', s*1000) end
     if s < 60   then return strfmt('%.2fs', s) end
@@ -367,14 +375,35 @@ function pf:rightfilter()
     return _cache.git_duration .. ' ' .. (' '):rep(_cache.offset) .. prompt
 end
 
+
+
+------------------------------- MISC -------------------------------
+
+-- print action and status legend
+-- print('diverged  ⇕          ahead       ⇡')
+-- print('behind    ⇣          conflicted  \243\177\144\139')
+-- print('staged    +          modified    !')
+-- print('renamed   »          deleted     X')
+-- print('tracked   ?          untracked   ??')
+-- print('stashed   ≡')
+-- print()
+-- 
+-- print('int rebase      Ri        rebase merge  Rm')
+-- print('rebase          \239\129\162         mail split    \238\172\156')
+-- print('mail s. rebase  amR       merging       \243\176\189\156')
+-- print('cherry-picking  \238\138\155         reverting     \239\129\160')
+-- print('bisecting       \243\176\135\148')
+-- print()
+-- print()
+
 -- benchmark clink git API calls
--- local function time_loop(f)
---     local duration = _now_s()
---     for i = 1, 100 do
---         _ = f()
---     end
---     return (_now_s() - duration) / 100
--- end
+--local function time_loop(f)
+--    local duration = _now_s()
+--    for i = 1, 100 do
+--        _ = f()
+--    end
+--    return (_now_s() - duration) / 100
+--end
 -- 
 -- local function bench()
 --     local funs = {
@@ -401,3 +430,33 @@ end
 -- clink.onbeginedit(function ()
 --     bench()
 -- end)
+-- benchmark alternative fast functions
+--local function bench_alt()
+--    local funs = {
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"getstashcount", getstashcount},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--        {"",              nil},
+--    }
+--    for i = 1, #funs do
+--        if not funs[i][2] then
+--            print()
+--        else
+--            duration = time_loop(funs[i][2])
+--            duration_color = duration>0.01 and config.color_dirty or config.color_clean
+--            print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
+--        end
+--    end
+--    print()
+--end
+--clink.onbeginedit(function ()
+--    bench_alt()
+--end)
