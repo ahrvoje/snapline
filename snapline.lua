@@ -69,21 +69,28 @@ local config = {
 
 -- recursive walk and format Lua table
 local function pp(t,i,s)
-    i=i or '' s=s or {}
-    if s[t] then return '<cycle>' end s[t]=1
-    local o={'{'}
+    i = i or ''
+    s = s or {}
+    if s[t] then return '<cycle>' end s[t] = 1
+    local o = {'{'}
     for k,v in pairs(t) do
-        k=type(k)=='string' and string.format('%q',k) or tostring(k)
-        v=type(v)=='table' and pp(v,i..'  ',s) or (type(v)=='string' and string.format('%q',v) or tostring(v))
-        o[#o+1]=('\n%s  [%s]=%s,'):format(i,k,v)
+        k = type(k)=='string' and string.format('%q',k) or tostring(k)
+        v = type(v)=='table' and pp(v,i..'  ',s) or (type(v)=='string' and string.format('%q',v) or tostring(v))
+        o[#o+1] = ('\n%s  [%s]=%s,'):format(i,k,v)
     end
-    s[t]=nil; o[#o+1]='\n'..i..'}'
+
+    s[t] = nil
+    o[#o+1] = '\n'..i..'}'
+
     return table.concat(o)
 end
 
 -- prettyprint Lua table
 function prettyprint(x, rl_buffer)
-    if rl_buffer and rl_buffer.beginoutput then rl_buffer:beginoutput() end
+    if rl_buffer and rl_buffer.beginoutput then
+        rl_buffer:beginoutput()
+    end
+
     (clink and clink.print or print)(type(x)=='table' and pp(x) or tostring(x))
 end
 
@@ -106,6 +113,20 @@ local function venv_name()
     if pv and #pv > 0 then return pv end
 
     return nil
+end
+
+-- fast stash check based on checking if .git\logs\refs\stash is empty
+local function hasstash()
+    local gd = git.getgitdir()
+    if not gd then return false end
+    
+    local f = io.open(gd..'\\logs\\refs\\stash', 'r')
+    if not f then return false end
+    
+    stash = f:read('*a')
+    f:close()
+
+    return stash ~= ''
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
@@ -132,8 +153,8 @@ end
 
 -- git status table using Clink's git API
 -- potentialy slow function in the focus of the entire story!
--- typical benchmark times for a single call
 --
+-- typical benchmark times for a single call
 --         no-repo dir                 repo dir
 --
 --         getaction   71µs            getaction   53µs
@@ -213,9 +234,7 @@ local function collect_status()
     if status.total and status.total.delete then
         info.deleted = status.total.delete
     end
-    
-    info.stash = getstashcount()
-        
+            
     return info
 end
 
@@ -235,10 +254,9 @@ local function git_render(info)
     if info.staged     > 0 then s[#s+1] = (fmt.staged):format(info.staged)         end
     if info.tracked    > 0 then s[#s+1] = (fmt.tracked):format(info.tracked)       end
     if info.untracked  > 0 then s[#s+1] = (fmt.untracked):format(info.untracked)   end
-    if info.stash      > 0 then s[#s+1] = (fmt.stashed):format(info.stash)         end
     
     local color = info.dirty_branch and config.color_dirty or config.color_clean
-    return color .. table.concat(s) .. config.color_reset .. ' '
+    return color .. table.concat(s) .. config.color_reset
 end
 
 local strfmt, floor = string.format, os.date, math.floor
@@ -262,7 +280,7 @@ end
 local _now_s = (clink and clink.gethrtime) and clink.gethrtime or os.clock
 
 -- measure the duration of last run command
-local _rp_last_start, _rp_last_dur_s, _rp_text
+local _rp_last_start, _rp_last_dur_s, right_prompt_time
 if clink and clink.onbeginedit then
     clink.onbeginedit(function ()
         if _rp_last_start then
@@ -273,10 +291,10 @@ if clink and clink.onbeginedit then
         local t = os.date('%H:%M:%S')
         local d = _rp_fmt_duration(_rp_last_dur_s)
         if d == '' then
-            _rp_text = config.color_time .. t
+            right_prompt_time = config.color_time .. t
         else
-            if #d<5 then d = string.format('%5s', d) end
-            _rp_text = config.color_took .. d .. ' ' .. config.color_time .. t
+            if #d < 5 then d = string.format('%5s', d) end
+            right_prompt_time = config.color_took .. d .. ' ' .. config.color_time .. t
         end
     end)
 end
@@ -365,14 +383,16 @@ end
 -- right filter, second in execution line so it just uses cached value
 -- provided by the left prompt async which is run before it
 function pf:rightfilter()
-    prompt = _rp_text
-    if _cache.git_render then
-        prompt = _cache.git_render .. prompt
-    end
+    local git_prompt = _cache.git_render or ''
+
+    local stash_count = getstashcount()
+    stash_prompt = stash_count>0 and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
+
+    prompt = _cache.git_duration .. ' ' .. git_prompt .. stash_prompt .. right_prompt_time
     
     -- if left prompt is async and shrinks after async op
     -- make sure right prompt it aligned by correct amount
-    return _cache.git_duration .. ' ' .. (' '):rep(_cache.offset) .. prompt
+    return (' '):rep(_cache.offset) .. prompt
 end
 
 
@@ -397,13 +417,13 @@ end
 -- print()
 
 -- benchmark clink git API calls
---local function time_loop(f)
---    local duration = _now_s()
---    for i = 1, 100 do
---        _ = f()
---    end
---    return (_now_s() - duration) / 100
---end
+-- local function time_loop(f)
+--     local duration, n = _now_s(), 3
+--     for i = 1, n do
+--         _ = f()
+--     end
+--     return (_now_s() - duration) / n
+-- end
 -- 
 -- local function bench()
 --     local funs = {
@@ -431,32 +451,32 @@ end
 --     bench()
 -- end)
 -- benchmark alternative fast functions
---local function bench_alt()
---    local funs = {
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"getstashcount", getstashcount},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---        {"",              nil},
---    }
---    for i = 1, #funs do
---        if not funs[i][2] then
---            print()
---        else
---            duration = time_loop(funs[i][2])
---            duration_color = duration>0.01 and config.color_dirty or config.color_clean
---            print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
---        end
---    end
---    print()
---end
---clink.onbeginedit(function ()
---    bench_alt()
---end)
+-- local function bench_alt()
+--     local funs = {
+--         {"",              nil},
+--         {"",              nil},
+--         {"hasstash",      hasstash},
+--         {"",              nil},
+--         {"",              nil},
+--         {"",              nil},
+--         {"",              nil},
+--         {"getstashcount", getstashcount},
+--         {"",              nil},
+--         {"",              nil},
+--         {"",              nil},
+--         {"",              nil},
+--     }
+--     for i = 1, #funs do
+--         if not funs[i][2] then
+--             print()
+--         else
+--             duration = time_loop(funs[i][2])
+--             duration_color = duration>0.01 and config.color_dirty or config.color_clean
+--             print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
+--         end
+--     end
+--     print()
+-- end
+-- clink.onbeginedit(function ()
+--     bench_alt()
+-- end)
