@@ -14,8 +14,10 @@ local function get_init_cache()
         git_duration = '',
         dirty_branch = nil,
         dirty_dir = nil,
-        length = nil,
-        offset = 0,
+        length_left = nil,
+        length_right = nil,
+        offset_left = nil,
+        offset_right = nil,
     }
 end
 local _cache = get_init_cache()
@@ -68,30 +70,22 @@ local config = {
 }
 
 -- recursive walk and format Lua table
-local function pp(t,i,s)
+local function prettyformat(t,i,s)
     i = i or ''
     s = s or {}
-    if s[t] then return '<cycle>' end s[t] = 1
+    if s[t] then return '<cycle>' end s[t]=1
+    
     local o = {'{'}
-    for k,v in pairs(t) do
-        k = type(k)=='string' and string.format('%q',k) or tostring(k)
-        v = type(v)=='table' and pp(v,i..'  ',s) or (type(v)=='string' and string.format('%q',v) or tostring(v))
-        o[#o+1] = ('\n%s  [%s]=%s,'):format(i,k,v)
+    for k, v in pairs(t) do
+        k = type(k)=='string' and string.format('%q', k) or tostring(k)
+        v = type(v)=='table' and prettyformat(v, i..'  ', s) or (type(v)=='string' and string.format('%q', v) or tostring(v))
+        o[#o+1] = ('\n%s  [%s]=%s,'):format(i, k, v)
     end
-
+    
     s[t] = nil
     o[#o+1] = '\n'..i..'}'
 
     return table.concat(o)
-end
-
--- prettyprint Lua table
-function prettyprint(x, rl_buffer)
-    if rl_buffer and rl_buffer.beginoutput then
-        rl_buffer:beginoutput()
-    end
-
-    (clink and clink.print or print)(type(x)=='table' and pp(x) or tostring(x))
 end
 
 -- extract venv name from env vars
@@ -192,7 +186,7 @@ local function collect_status()
     
     --    arg1 = no_untracked, arg2 = include_submodules
     local status = git.getstatus(false, false)
-    -- prettyprint(status)
+    --print(prettyformat(status))
     
     if not status then
         info.dirty_branch  = nil
@@ -346,14 +340,16 @@ local function git_left_prompt()
     return prompt
 end
 
-local pf = clink.promptfilter(300)
+local pf = clink.promptfilter(100)
 -- left prompt, it is first in execution line so it contains the async part
-function pf:filter(prompt)
+function pf:filter()
     local response = clink.promptcoroutine(profile)
-    if response and response.info then
-        _cache.dirty_branch = response.info.dirty_branch
-        _cache.dirty_dir = response.info.dirty_dir
-        _cache.git_render = git_render(response.info)
+    if response then
+        if response.info then
+            _cache.dirty_branch = response.info.dirty_branch
+            _cache.dirty_dir = response.info.dirty_dir
+            _cache.git_render = git_render(response.info)
+        end
     end
     if config.profile and response and response.duration then
         _cache.git_duration = _rp_fmt_duration(response.duration)
@@ -365,17 +361,19 @@ function pf:filter(prompt)
     end
     
     venv = venv_name()
-    prompt = venv and (config.color_venv .. '{' .. venv_name() .. '} ') or ''
+    prompt = venv and (config.color_venv .. '{' .. venv .. '} ') or ''
     prompt = prompt .. git_left_prompt()
     prompt = prompt .. dir_color .. dir_name() .. ' '
     prompt = prompt .. config.color_reset .. '> '
-    
-    if not _cache.length then
-        _cache.length = #prompt
+    if not response then
+        -- cache sync length of prompt so it can be used for offset after async finishes
+        _cache.length_left = #prompt
+        _cache.offset_left = nil
     else        
-        -- if left prompt shrinks after async get offset to keep right prompt informed
-        _cache.offset =  (_cache.length > #prompt) and (_cache.length - #prompt) or 0
-        _cache.length = #prompt
+        -- if left prompt shrinks after async, i.e. new length is smaller
+        -- calculate and cache the offset to keep right prompt informed
+        o = _cache.length_left - #prompt
+        _cache.offset_left =  math.max(o, 0)
     end
     
     return prompt
@@ -383,17 +381,25 @@ end
 -- right filter, second in execution line so it just uses cached value
 -- provided by the left prompt async which is run before it
 function pf:rightfilter()
-    local git_prompt = _cache.git_render or ''
+    local git_prompt = _cache.git_render
 
     local stash_count = getstashcount()
-    stash_prompt = stash_count>0 and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
+    stash_prompt = (stash_count>0) and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
 
     prompt = _cache.git_duration .. ' ' .. git_prompt .. stash_prompt .. right_prompt_time
-    
-    -- if left prompt is async and shrinks after async op
-    -- make sure right prompt it aligned by correct amount
-    return (' '):rep(_cache.offset) .. prompt
+    if _cache.offset_left == nil then
+        _cache.length_right = #prompt
+        return prompt
+    else
+        -- if left prompt is async and shrinks after async op
+        -- make sure right prompt it aligned by correct amount
+        o = _cache.length_right - #prompt
+        _cache.offset_right = math.max(o, 0)
+        offset_total = _cache.offset_left + _cache.offset_right
+        return (' '):rep(offset_total) .. prompt
+    end
 end
+
 
 
 
