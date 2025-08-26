@@ -6,7 +6,8 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) focus
   * Using only sub-millisecond calls to build the prompt.
   * Async all delays so editing is never blocked.
   * Cache last results so the content is always & instantly present.
-  * Clink git methods benchmark, and alternative implementations; red are only called async
+  * Benchmark of Clink methods, and alternative implementations; red are only called async
+    * Antivirus can dramatically impare performance if set to aggresive protection mode.
     <p align="center"><img src="resources/clink_benchmark.png" width="7500"></p>
 ## Info
 ### Left prompt
