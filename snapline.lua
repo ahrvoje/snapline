@@ -249,7 +249,7 @@ local function git_render(info)
     return color .. table.concat(s) .. config.color_reset
 end
 
-local strfmt, floor = string.format, os.date, math.floor
+local strfmt, floor = string.format, math.floor
 local function _rp_fmt_duration(s)
     if not s or s < 1e-9 then return '' end
     
@@ -348,7 +348,7 @@ function pf:filter()
         end
     end
     if config.profile and response and response.duration then
-        _cache.git_duration = _rp_fmt_duration(response.duration)
+        _cache.git_duration = _rp_fmt_duration(response.duration) .. ' '
     end
     
     local dir_color = config.color_reset
@@ -359,8 +359,8 @@ function pf:filter()
     venv = venv_name()
     prompt = venv and (config.color_venv .. '{' .. venv .. '} ') or ''
     prompt = prompt .. git_left_prompt()
-    prompt = prompt .. dir_color .. dir_name() .. ' '
-    prompt = prompt .. config.color_reset .. '> '
+    prompt = prompt .. dir_color .. dir_name()
+    prompt = prompt .. ' ' .. config.color_reset .. '> '
     
     return prompt
 end
@@ -370,9 +370,9 @@ function pf:rightfilter()
     local git_prompt = _cache.git_render
 
     local stash_count = getstashcount()
-    stash_prompt = (stash_count>0) and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
+    stash_prompt = (stash_count>0) and config.color_clean..(config.status_format.stashed):format(stash_count)..' ' or ''
 
-    prompt = _cache.git_duration .. ' ' .. git_prompt .. stash_prompt .. right_prompt_time
+    prompt = _cache.git_duration .. git_prompt .. stash_prompt .. right_prompt_time
 
     return prompt
 end
