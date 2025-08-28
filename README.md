@@ -8,7 +8,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Cache last results so the content is always & instantly present.
   * Implement alternative methods proven to run much faster.
   * Benchmark of Clink methods, and alternative implementations; red are only called async
-    <p align="center"><img src="resources/clink_benchmark.png" width="640"></p>
+    <img src="resources/clink_benchmark.png" width="640" style="margin-left: 50px">
 ## Info
 ### Left prompt
   * virtual environment in yellow
