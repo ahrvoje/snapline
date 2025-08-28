@@ -76,6 +76,7 @@ local function clean(t)
     
     return out
 end
+
 -- recursive walk and format Lua table
 local function prettyformat(t,i,s)
     if not t then return '' end
@@ -118,34 +119,27 @@ local function venv_name()
     return nil
 end
 
--- fast stash check based on checking if .git\logs\refs\stash is empty
-local function hasstash()
+local function getstash()
     local gd = git.getgitdir()
-    if not gd then return false end
+    if not gd then return '' end
     
     local f = io.open(gd..'\\logs\\refs\\stash', 'r')
-    if not f then return false end
+    if not f then return '' end
     
     stash = f:read('*a')
     f:close()
+    
+    return stash
+end
 
-    return stash ~= ''
+-- fast stash check based on checking if .git\logs\refs\stash is empty
+local function hasstash()
+    return getstash() ~= ''
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local gd = git.getgitdir()
-    if not gd then return 0 end
-    
-    local f = io.open(gd..'\\logs\\refs\\stash', 'r')
-    if not f then return 0 end
-    
-    stash = f:read('*a')
-    f:close()
-    if not stash then return 0 end
-    
-    _, n = stash:gsub('\n', '\n')
-    
+    local _, n = getstash():gsub('\n', '\n')
     return n
 end
 
@@ -372,8 +366,8 @@ function pf:filter()
     
     return table.concat(clean(prompt_parts), ' ')
 end
--- right filter, second in execution line so it just uses cached value
--- provided by the left prompt async which is run before it
+-- right filter, second in execution line so it just uses cached values
+-- provided by the left prompt which is run async before it
 function pf:rightfilter()
     local git_prompt = _cache.git_render
     
