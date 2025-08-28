@@ -8,8 +8,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Cache last results so the content is always & instantly present.
   * Implement alternative methods proven to run much faster.
   * Benchmark of Clink methods, and alternative implementations; red are only called async
-    * Antivirus can dramatically impare performance if set to aggresive protection mode.
-    <p align="center"><img src="resources/clink_benchmark.png" width="7500"></p>
+    <p align="center"><img src="resources/clink_benchmark.png" width="640"></p>
 ## Info
 ### Left prompt
   * virtual environment in yellow
