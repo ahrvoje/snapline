@@ -28,13 +28,15 @@ end)
 
 local config = {
     branch_symbol = '\238\130\160',       -- UTF-8 code for branch glyph
-    color_venv  = '\x1b[33m',             -- yellow
-    color_state = '\x1b[33m',             -- yellow
-    color_clean = '\x1b[32m',             -- green
-    color_dirty = '\x1b[38;2;200;90;90m', -- red
-    color_took  = '\x1b[38;5;242m',       -- gray (bright black)
-    color_time  = '\x1b[38;5;109m',       -- dim cyan
-    color_reset = '\x1b[0m',
+    color = {
+        venv = '\x1b[33m',             -- yellow
+        state = '\x1b[33m',             -- yellow
+        clean = '\x1b[32m',             -- green
+        dirty = '\x1b[38;2;200;90;90m', -- red
+        took  = '\x1b[38;5;242m',       -- gray (bright black)
+        now   = '\x1b[38;5;109m',       -- dim cyan
+        reset = '\x1b[0m',
+    },
     -- https://chrisant996.github.io/clink/clink.html#git.getstatus
     status_format = {
         diverged   = '⇕',    -- if ahead and behind at the same time
@@ -126,7 +128,7 @@ local function getstash()
     local f = io.open(gd..'\\logs\\refs\\stash', 'r')
     if not f then return '' end
     
-    stash = f:read('*a')
+    local stash = f:read('*a')
     f:close()
     
     return stash
@@ -182,7 +184,7 @@ local function collect_status()
         statech      = nil,
     }
     
-    --    arg1 = no_untracked, arg2 = include_submodules
+    -- arg1: no_untracked, arg2: include_submodules
     local status = git.getstatus(false, false)
     --print(prettyformat(status))
     
@@ -248,48 +250,47 @@ local function git_render(info)
     if info.tracked    > 0 then s[#s+1] = (fmt.tracked):format(info.tracked)       end
     if info.untracked  > 0 then s[#s+1] = (fmt.untracked):format(info.untracked)   end
     
-    local color = info.dirty_branch and config.color_dirty or config.color_clean
-    return color .. table.concat(clean(s), ' ') .. config.color_reset
+    local color = info.dirty_branch and config.color.dirty or config.color.clean
+    return color .. table.concat(clean(s), ' ') .. config.color.reset
 end
 
-local strfmt, floor = string.format, math.floor
-local function _rp_fmt_duration(s)
+local function fmt_duration(s)
     if not s or s < 1e-6 then return '' end
     
-    if s < 1e-3 then return strfmt('%.0fµs', s*1000000) end
-    if s < 1    then return strfmt('%.0fms', s*1000) end
-    if s < 60   then return strfmt('%.2fs', s) end
+    if s < 1e-3 then return string.format('%.0fµs', s*1000000) end
+    if s < 1    then return string.format('%.0fms', s*1000) end
+    if s < 60   then return string.format('%.2fs', s) end
     
-    local m = floor(s/60)
-    local r = floor(s - m*60 + 0.5)
-    if m < 60 then return strfmt('%dm%ds', m, r) end
+    local m = math.floor(s/60)
+    local r = math.floor(s - m*60 + 0.5)
+    if m < 60 then return string.format('%dm%ds', m, r) end
     
-    local h, m = floor(m/60), m % 60
-    return strfmt('%dh%dm%ds', h, m, r)
+    local h, m = math.floor(m/60), m % 60
+    return string.format('%dh%dm%ds', h, m, r)
 end
 
 -- measure the duration of last run command
-local _rp_last_start, _rp_last_dur_s, right_prompt_time
+local last_start, last_dur_s, right_prompt_time
 if clink and clink.onbeginedit then
     clink.onbeginedit(function ()
-        if _rp_last_start then
-            _rp_last_dur_s = os.clock() - _rp_last_start
-            _rp_last_start = nil
+        if last_start then
+            last_dur_s = os.clock() - last_start
+            last_start = nil
         end
         
         local t = os.date('%H:%M:%S')
-        local d = _rp_fmt_duration(_rp_last_dur_s)
+        local d = fmt_duration(last_dur_s)
         if d == '' then
-            right_prompt_time = config.color_time .. t
+            right_prompt_time = config.color.now .. t
         else
             if #d < 5 then d = string.format('%5s', d) end
-            right_prompt_time = config.color_took .. d .. ' ' .. config.color_time .. t
+            right_prompt_time = config.color.took .. d .. ' ' .. config.color.now .. t
         end
     end)
 end
 if clink and clink.onendedit then
     clink.onendedit(function ()
-        _rp_last_start = os.clock()
+        last_start = os.clock()
     end)
 end
 
@@ -318,11 +319,11 @@ local function git_left_prompt()
     
     local branch = git.getbranch()
     if branch then
-        local branch_color = config.color_reset
+        local branch_color = config.color.reset
         if _cache.dirty_branch ~= nil then
-            branch_color = _cache.dirty_branch and config.color_dirty or config.color_clean
+            branch_color = _cache.dirty_branch and config.color.dirty or config.color.clean
         end
-        table.insert(prompt_parts, branch_color .. config.branch_symbol .. branch .. config.color_reset)
+        table.insert(prompt_parts, branch_color .. config.branch_symbol .. branch .. config.color.reset)
     end
     
     -- https://github.com/chrisant996/clink/blob/master/clink/app/scripts/git.lua#L732
@@ -330,7 +331,7 @@ local function git_left_prompt()
     local action = git.getaction()
     if action then
         action_key = action:gsub('-', '_'):gsub('/', '_')
-        table.insert(prompt_parts, config.color_state .. config.action_symbol[action_key] .. config.color_reset)
+        table.insert(prompt_parts, config.color.state .. config.action_symbol[action_key] .. config.color.reset)
     end
     
     return table.concat(clean(prompt_parts), ' ')
@@ -348,19 +349,19 @@ function pf:filter()
         end
     end
     if config.profile and response and response.duration then
-        _cache.git_duration = _rp_fmt_duration(response.duration)
+        _cache.git_duration = fmt_duration(response.duration)
     end
     
-    local dir_color = config.color_reset
+    local dir_color = config.color.reset
     if _cache.dirty_dir ~= nil then
-        dir_color = _cache.dirty_dir and config.color_dirty or config.color_clean
+        dir_color = _cache.dirty_dir and config.color.dirty or config.color.clean
     end
     
     venv = venv_name()
     prompt_parts = {
-        venv and (config.color_venv .. '{' .. venv .. '}') or '',
+        venv and (config.color.venv .. '{' .. venv .. '}') or '',
         git_left_prompt(),
-        dir_color..dir_name()..config.color_reset,
+        dir_color..dir_name()..config.color.reset,
         '> ',
     }
     
@@ -372,7 +373,7 @@ function pf:rightfilter()
     local git_prompt = _cache.git_render
     
     local stash_count = getstashcount()
-    stash_prompt = (stash_count>0) and config.color_clean..(config.status_format.stashed):format(stash_count) or ''
+    stash_prompt = (stash_count>0) and config.color.clean..(config.status_format.stashed):format(stash_count) or ''
     
     prompt_parts = {
         _cache.git_duration,
@@ -393,8 +394,7 @@ end
 
 
 ------------------------------- MISC -------------------------------
-
--- print action and status legend
+-- action and status legend
 -- print('diverged  ⇕          ahead       ⇡')
 -- print('behind    ⇣          conflicted  \243\177\144\139')
 -- print('staged    +          modified    !')
@@ -413,7 +413,7 @@ end
 
 -- benchmark clink git API calls
 -- local function time_loop(f)
---     local duration, n = os.clock(), 3
+--     local duration, n = os.clock(), 10
 --     for i = 1, n do
 --         _ = f()
 --     end
@@ -437,14 +437,15 @@ end
 --     }
 --     for i = 1, #funs do
 --         duration = time_loop(funs[i][2])
---         duration_color = duration>0.01 and config.color_dirty or config.color_clean
---         print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
+--         duration_color = duration>0.01 and config.color.dirty or config.color.clean
+--         print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. fmt_duration(duration))
 --     end
 --     print()
 -- end
 -- clink.onbeginedit(function ()
 --     bench()
 -- end)
+
 -- benchmark alternative fast functions
 -- local function bench_alt()
 --     local funs = {
@@ -466,8 +467,8 @@ end
 --             print()
 --         else
 --             duration = time_loop(funs[i][2])
---             duration_color = duration>0.01 and config.color_dirty or config.color_clean
---             print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. _rp_fmt_duration(duration))
+--             duration_color = duration>0.01 and config.color.dirty or config.color.clean
+--             print(duration_color .. string.format('%18s', funs[i][1]) .. '   ' .. fmt_duration(duration))
 --         end
 --     end
 --     print()
