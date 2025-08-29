@@ -339,13 +339,12 @@ if clink and clink.onendedit then
 end
 
 local function dir_name()
-    local cwd = getenv('CD') or ''
+    local cwd = _cache.cwd
     local base = path.getbasename(cwd)
     if base and #base > 0 then return base end
     
     -- at drive root give readable name, e.g. for 'C:\' give 'C:'
-    local drive = cwd:match('^(%a:)')
-    return drive or cwd
+    return cwd:match('^(%a:)') or cwd
 end
 
 local function profile()
