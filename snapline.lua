@@ -5,9 +5,10 @@
 --         stashed=' ≡N' modified=' !N' staged=' +N' renamed=' »N' deleted=' XN' untracked=' ??'
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 
+local clock  = os.clock
+local concat = table.concat
 local floor  = math.floor
 local format = string.format
-local concat = table.concat
 local getenv = os.getenv
 
 -- cached values used for fast prompt render to keep CLI snappy
@@ -15,6 +16,9 @@ local getenv = os.getenv
 local function get_init_cache()
     return {
         cwd = '',
+        stash_path = nil,
+        stash_size = nil,
+        stash_count = 0,
         git_render = '',
         git_duration = '',
         dirty_branch = nil,
@@ -32,9 +36,9 @@ clink.onbeginedit(function ()
 end)
 
 local config = {
-    branch_symbol = '\238\130\160',       -- UTF-8 code for branch glyph
+    branch_symbol = '\238\130\160',     -- UTF-8 code for branch glyph
     color = {
-        venv = '\x1b[33m',             -- yellow
+        venv = '\x1b[33m',              -- yellow
         state = '\x1b[33m',             -- yellow
         clean = '\x1b[32m',             -- green
         dirty = '\x1b[38;2;200;90;90m', -- red
@@ -76,44 +80,40 @@ local config = {
 -- remove nil and '' elements from a table
 local function clean(t)
     local out = {}
-
-    for i = 1, #t do
-        local s = t[i]
+    
+    for _, s in ipairs(t) do
         if s and s ~= '' then out[#out+1] = s end
     end
     
     return out
 end
 
-local DEBUG = false
-if DEBUG then
-    -- recursive walk and format Lua table
-    local function prettyformat(t,i,s)
-        if not t then return '' end
-    
-        i = i or ''
-        s = s or {}
-        if s[t] then return '<cycle>' end s[t]=1
-        
-        local o = {'{'}
-        for k, v in pairs(t) do
-            k = type(k)=='string' and format('%q', k) or tostring(k)
-            v = type(v)=='table' and prettyformat(v, i..'  ', s) or (type(v)=='string' and format('%q', v) or tostring(v))
-            o[#o+1] = ('\n%s  [%s]=%s,'):format(i, k, v)
-        end
-        
-        s[t] = nil
-        o[#o+1] = '\n'..i..'}'
-    
-        return concat(o)
-    end
-end
+-- recursive walk and format Lua table
+-- local function prettyformat(t,i,s)
+--     if not t then return '' end
+--     
+--     i = i or ''
+--     s = s or {}
+--     if s[t] then return '<cycle>' end s[t]=1
+--     
+--     local o = {'{'}
+--     for k, v in pairs(t) do
+--         k = type(k)=='string' and format('%q', k) or tostring(k)
+--         v = type(v)=='table' and prettyformat(v, i..'  ', s) or (type(v)=='string' and format('%q', v) or tostring(v))
+--         o[#o+1] = ('\n%s  [%s]=%s,'):format(i, k, v)
+--     end
+--     
+--     s[t] = nil
+--     o[#o+1] = '\n'..i..'}'
+--     
+--     return concat(o)
+-- end
 
 -- extract venv name from env vars
 local function venv_name()
     local v = getenv('VIRTUAL_ENV')
     if v and #v > 0 then return path.getbasename(v) end
-
+    
     -- conda
     local cpm = getenv('CONDA_PROMPT_MODIFIER')
     if cpm and #cpm > 0 then
@@ -122,48 +122,68 @@ local function venv_name()
     end
     local c = getenv('CONDA_DEFAULT_ENV')
     if c and #c > 0 then return c end
-
+    
     -- python
     local pv = getenv('PYENV_VERSION')
     if pv and #pv > 0 then return pv end
-
+    
     return nil
 end
 
-local function getstashpath()
+local function getstashpathsize()
     local gd = git.getgitdir()
-    if not gd then return nil end
+    if not gd then
+        _cache.stash_path = nil
+        _cache.stash_size = nil
+        _cache.stash_count = 0
+        return nil, nil
+    end
     
-    return gd..'\\logs\\refs\\stash'
-end
-
--- fast stash check based on checking if .git\logs\refs\stash is empty
-local function hasstash()
-    local stashpath = getstashpath()
-    if not stashpath then return false end
-
+    local stashpath = gd .. '\\logs\\refs\\stash'    
     local f = io.open(stashpath, 'rb')
-    if not f then return false end
+    if not f then
+        _cache.stash_path = nil
+        _cache.stash_size = nil
+        _cache.stash_count = 0
+        return nil, nil
+    end
     
     local sz = f:seek('end')
     f:close()
     
+    return stashpath, sz
+end
+
+-- fast stash check based on checking if .git\logs\refs\stash is empty
+local function hasstash()
+    local sz
+    _, sz = getstashpathsize()
     return (sz or 0) > 0
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local stashpath = getstashpath()
+    local stashpath, sz
+    
+    stashpath, sz = getstashpathsize()
     if not stashpath then return 0 end
-
-    local f = io.open(stashpath, 'r')
-    if not f then return 0 end
     
-    local stash = f:read('*a')
-    f:close()
+    if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
+        return _cache.stash_count
+    end
+    _cache.stash_path = stashpath
+    _cache.stash_size = sz
     
-    local _, n = stash:gsub('\n', '\n')
-    return n
+    local f = io.open(stashpath, 'rb')
+    if not f then
+        _cache.stash_count = 0
+    else    
+        local stash = f:read('*a')
+        f:close()
+        _, _cache.stash_count = stash:gsub('\n', '\n')
+    end
+    
+    return _cache.stash_count
 end
 
 -- git status table using Clink's git API
@@ -207,7 +227,7 @@ local function collect_status()
     
     -- arg1: no_untracked, arg2: include_submodules
     local status = git.getstatus(false, false)
-    if DEBUG then print(prettyformat(status)) end
+    -- print(prettyformat(status))
     
     if not status then
         info.dirty_branch  = nil
@@ -271,6 +291,10 @@ local function git_render(info)
     if info.tracked    > 0 then s[#s+1] = (fmt.tracked):format(info.tracked)       end
     if info.untracked  > 0 then s[#s+1] = (fmt.untracked):format(info.untracked)   end
     
+    -- this line must not return empty string
+    -- or right prompt does not get redrawn after async!
+    if #s == 0 then return config.color.reset end
+    
     local color = info.dirty_branch and config.color.dirty or config.color.clean
     return color .. concat(s, ' ') .. config.color.reset
 end
@@ -295,7 +319,7 @@ local last_start, last_dur_s, right_prompt_time
 if clink and clink.onbeginedit then
     clink.onbeginedit(function ()
         if last_start then
-            last_dur_s = os.clock() - last_start
+            last_dur_s = clock() - last_start
             last_start = nil
         end
         
@@ -310,7 +334,7 @@ if clink and clink.onbeginedit then
 end
 if clink and clink.onendedit then
     clink.onendedit(function ()
-        last_start = os.clock()
+        last_start = clock()
     end)
 end
 
@@ -318,7 +342,7 @@ local function dir_name()
     local cwd = getenv('CD') or ''
     local base = path.getbasename(cwd)
     if base and #base > 0 then return base end
-
+    
     -- at drive root give readable name, e.g. for 'C:\' give 'C:'
     local drive = cwd:match('^(%a:)')
     return drive or cwd
@@ -327,9 +351,9 @@ end
 local function profile()
     local response = {}
     
-    if config.profile then response.duration = os.clock() end
+    if config.profile then response.duration = clock() end
     response.info = collect_status()
-    if config.profile then response.duration = os.clock() - response.duration end
+    if config.profile then response.duration = clock() - response.duration end
     
     return response
 end
@@ -355,7 +379,7 @@ local function git_left_prompt()
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
     
-    return concat(clean(prompt_parts), ' ')
+    return concat(prompt_parts, ' ')
 end
 
 local pf = clink.promptfilter(100)
@@ -434,11 +458,11 @@ end
 
 -- benchmark clink git API calls
 -- local function time_loop(f)
---     local duration, n = os.clock(), 10
+--     local duration, n = clock(), 10
 --     for i = 1, n do
 --         _ = f()
 --     end
---     return (os.clock() - duration) / n
+--     return (clock() - duration) / n
 -- end
 
 -- local function bench()
