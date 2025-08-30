@@ -152,7 +152,7 @@ local function getstashsizepath()
         return nil, nil
     end
     
-    local stashpath = gd .. '\\logs\\refs\\stash'    
+    local stashpath = gd .. '\\logs\\refs\\stash'
     local f = io.open(stashpath, 'rb')
     if not f then
         _cache.stash_path = nil
