@@ -36,6 +36,16 @@ clink.onbeginedit(function ()
 end)
 
 local config = {
+    -- Nerd Fonts tables: https://www.nerdfonts.com/cheat-sheet
+    --
+    -- Python convert UTF-16 to UTF-8 and back for branch symbol \ue0a0
+    --     list('\ue0a0'.encode('utf-8'))          >  [238, 130, 160]
+    --     bytes([238, 130, 160]).decode('utf-8')  >  '\ue0a0'
+    --
+    -- For non-BMP glyphs contaning more than 4 unicode digits
+    --     list('\U000f140b'.encode('utf-8'))           >  [243, 177, 144, 139]
+    --     bytes([243, 177, 144, 139]).decode('utf-8')  >  '\U000f140b'
+    
     branch_symbol = '\238\130\160',     -- UTF-8 code for branch glyph
     color = {
         venv = '\x1b[33m',              -- yellow
@@ -293,14 +303,16 @@ local function git_render(info)
     
     -- this line must not return empty string
     -- or right prompt does not get redrawn after async!
-    if #s == 0 then return config.color.reset end
+    local ENSURE_REDRAW = config.color.reset
+    if #s == 0 then return ENSURE_REDRAW end
     
     local color = info.dirty_branch and config.color.dirty or config.color.clean
     return color .. concat(s, ' ') .. config.color.reset
 end
 
 local function fmt_duration(s)
-    if not s or s < 1e-6 then return '' end
+    local CLOCK_PRECISION = 1e-6
+    if not s or s < CLOCK_PRECISION then return '' end
     
     if s < 1e-3 then return format('%.0fµs', s*1000000) end
     if s < 1    then return format('%.0fms', s*1000) end
@@ -327,7 +339,8 @@ if clink and clink.onbeginedit then
         
         local d = fmt_duration(last_dur_s)
         if d ~= '' then
-            if #d < 5 then d = format('%5s', d) end
+            local MINIMAL_WIDTH = 5
+            if #d < MINIMAL_WIDTH then d = format('%5s', d) end
             right_prompt_time = config.color.took .. d .. ' ' .. right_prompt_time
         end
     end)
@@ -381,7 +394,8 @@ local function git_left_prompt()
     return concat(prompt_parts, ' ')
 end
 
-local pf = clink.promptfilter(100)
+local FILTER_PRIORITY = 100  -- bigger prints earlier
+local pf = clink.promptfilter(FILTER_PRIORITY)
 -- left prompt, it is first in execution line so it contains the async part
 function pf:filter()
     local response = clink.promptcoroutine(profile)
@@ -432,7 +446,8 @@ end
 -- so line is cleared right before prompt render
 function pf:surround()
     -- prefix, suffix, rprefix, rsuffix
-    return '\x1b[2K', '', '', ''
+    local CLEAR_LINE = '\x1b[2K'
+    return CLEAR_LINE, '', '', ''
 end
 
 
