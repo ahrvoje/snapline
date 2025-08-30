@@ -38,6 +38,9 @@ end)
 local config = {
     -- Nerd Fonts tables: https://www.nerdfonts.com/cheat-sheet
     --
+    -- 30.08.2025. Clink uses Lua 5.2 which doesn't support Unicode literals
+    -- It can use UTF-8, so conversion from UTF-16 to UTF-8 is presented
+    --
     -- Python convert UTF-16 to UTF-8 and back for branch symbol \ue0a0
     --     list('\ue0a0'.encode('utf-8'))          >  [238, 130, 160]
     --     bytes([238, 130, 160]).decode('utf-8')  >  '\ue0a0'
@@ -386,7 +389,8 @@ local function git_left_prompt()
     -- rebase-i rebase-m rebase am am/rebase merging cherry-picking reverting bisecting
     local action = git.getaction()
     if action then
-        local action_key = action:gsub('[-/]', '_')
+        local FORBIDDEN_SYMBOLS = '[-/]'  -- replace with '_'
+        local action_key = action:gsub(FORBIDDEN_SYMBOLS, '_')
         local symbol = config.action_symbol[action_key] or config.action_symbol.unknown
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
@@ -442,11 +446,10 @@ function pf:rightfilter()
     
     return concat(clean(prompt_parts), ' ')
 end
--- put clear line code before left prompt
--- so line is cleared right before prompt render
 function pf:surround()
-    -- prefix, suffix, rprefix, rsuffix
+    -- clear line code before left prompt, clean entire line (left & right) before prompt render
     local CLEAR_LINE = '\x1b[2K'
+    -- prefix, suffix, rprefix, rsuffix
     return CLEAR_LINE, '', '', ''
 end
 
