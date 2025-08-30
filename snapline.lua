@@ -304,11 +304,8 @@ local function git_render(info)
     if info.tracked    > 0 then s[#s+1] = (fmt.tracked):format(info.tracked)       end
     if info.untracked  > 0 then s[#s+1] = (fmt.untracked):format(info.untracked)   end
     
-    -- this line must not return empty string
-    -- or right prompt does not get redrawn after async!
-    local ENSURE_REDRAW = config.color.reset
-    if #s == 0 then return ENSURE_REDRAW end
-    
+    -- render must not be empty string or right prompt doesn't get redrawn after async!
+    -- so if git info is empty still return it wrapped in colors - don't simplify to ''
     local color = info.dirty_branch and config.color.dirty or config.color.clean
     return color .. concat(s, ' ') .. config.color.reset
 end
@@ -398,7 +395,7 @@ local function git_left_prompt()
     return concat(prompt_parts, ' ')
 end
 
-local FILTER_PRIORITY = 100  -- bigger prints earlier
+local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
 -- left prompt, it is first in execution line so it contains the async part
 function pf:filter()
@@ -447,7 +444,8 @@ function pf:rightfilter()
     return concat(clean(prompt_parts), ' ')
 end
 function pf:surround()
-    -- clear line code before left prompt, clean entire line (left & right) before prompt render
+    -- clear line code before left prompt to clean entire line (left & right) before prompt render
+    -- otherwise stray glyphs can persist if left prompt gets shorter after async call
     local CLEAR_LINE = '\x1b[2K'
     -- prefix, suffix, rprefix, rsuffix
     return CLEAR_LINE, '', '', ''
