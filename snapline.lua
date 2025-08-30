@@ -143,7 +143,7 @@ local function venv_name()
     return nil
 end
 
-local function getstashpathsize()
+local function getstashsizepath()
     local gd = git.getgitdir()
     if not gd then
         _cache.stash_path = nil
@@ -169,12 +169,12 @@ end
 
 -- fast stash check based on checking if .git\logs\refs\stash is empty
 local function hasstash()
-    return (getstashpathsize() or 0) > 0
+    return (getstashsizepath() or 0) > 0
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local sz, stashpath = getstashpathsize()
+    local sz, stashpath = getstashsizepath()
     if not stashpath then return 0 end
     
     if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
