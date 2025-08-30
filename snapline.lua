@@ -5,7 +5,7 @@
 --         stashed=' ≡N' modified=' !N' staged=' +N' renamed=' »N' deleted=' XN' untracked=' ??'
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 
-local clock  = os.clock
+local clock  = os.clock      -- Clink clock returning seconds with us precision
 local concat = table.concat
 local floor  = math.floor
 local format = string.format
@@ -164,21 +164,17 @@ local function getstashpathsize()
     local sz = f:seek('end')
     f:close()
     
-    return stashpath, sz
+    return sz, stashpath
 end
 
 -- fast stash check based on checking if .git\logs\refs\stash is empty
 local function hasstash()
-    local sz
-    _, sz = getstashpathsize()
-    return (sz or 0) > 0
+    return (getstashpathsize() or 0) > 0
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local stashpath, sz
-    
-    stashpath, sz = getstashpathsize()
+    local sz, stashpath = getstashpathsize()
     if not stashpath then return 0 end
     
     if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
@@ -311,7 +307,7 @@ local function git_render(info)
 end
 
 local function fmt_duration(s)
-    local CLOCK_PRECISION = 1e-6
+    local CLOCK_PRECISION = 1e-6  -- Clink clock returning seconds with us precision
     if not s or s < CLOCK_PRECISION then return '' end
     
     if s < 1e-3 then return format('%.0fµs', s*1000000) end
@@ -403,8 +399,8 @@ function pf:filter()
     if response then
         if response.info then
             _cache.dirty_branch = response.info.dirty_branch
-            _cache.dirty_dir = response.info.dirty_dir
-            _cache.git_render = git_render(response.info)
+            _cache.dirty_dir    = response.info.dirty_dir
+            _cache.git_render   = git_render(response.info)
         end
     end
     if config.profile and response and response.duration then
