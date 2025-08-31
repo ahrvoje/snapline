@@ -161,6 +161,7 @@ local function getstashsizepath()
         return nil, nil
     end
     
+    -- getting file size is super quick, use opportunity to get it here
     local sz = f:seek('end')
     f:close()
     
@@ -177,19 +178,19 @@ local function getstashcount()
     local sz, stashpath = getstashsizepath()
     if not stashpath then return 0 end
     
+    -- return cached stash count if cache is of the same path and stash file size
     if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
         return _cache.stash_count
     end
-    _cache.stash_path = stashpath
     _cache.stash_size = sz
+    _cache.stash_path = stashpath
     
     local f = io.open(stashpath, 'rb')
     if not f then
         _cache.stash_count = 0
     else    
-        local stash = f:read('*a')
+        _, _cache.stash_count = f:read('*a'):gsub('\n', '\n')
         f:close()
-        _, _cache.stash_count = stash:gsub('\n', '\n')
     end
     
     return _cache.stash_count
@@ -220,7 +221,6 @@ local function collect_status()
     local info = {
         ahead        = 0,
         behind       = 0,
-        stash        = 0,
         tracked      = 0,
         untracked    = 0,
         modified     = 0,
@@ -228,23 +228,15 @@ local function collect_status()
         renamed      = 0,
         deleted      = 0,
         conflicted   = 0,
-        dirty_branch = false,
-        dirty_dir    = false,
-        state        = nil,
-        statech      = nil,
+        dirty_branch = nil,
+        dirty_dir    = nil,
     }
     
-    -- arg1: no_untracked, arg2: include_submodules
+    -- arg1: ignore untracked, arg2: include submodules
     local status = git.getstatus(false, false)
-    -- print(prettyformat(status))
+    if not status then return nil end
+    -- print(prettyformat(status))  -- for debugging
     
-    if not status then
-        info.dirty_branch  = nil
-        info.dirty_dir = nil
-        return info
-    end
-
-    -- overall dirty bit.
     info.dirty_branch = status.dirty and true or false
     
     -- ahead/behind (numbers or nil)
@@ -393,7 +385,7 @@ end
 
 local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
--- left prompt, it is first in execution line so it contains the async part
+-- left prompt, first in execution line so it contains async promptcoroutine
 function pf:filter()
     local response = clink.promptcoroutine(profile)
     if response then
@@ -422,17 +414,15 @@ function pf:filter()
     
     return concat(clean(prompt_parts), ' ')
 end
--- right filter, second in execution line so it just uses cached values
--- provided by the left prompt which is run async before it
+-- right filter, second in execution line so it doesn't contain async calls
+-- it uses cached values provided by the left prompt after its async call
 function pf:rightfilter()
-    local git_prompt = _cache.git_render
-    
     local stash_count = getstashcount()
     local stash_prompt = (stash_count>0) and config.color.clean..(config.status_format.stashed):format(stash_count)..config.color.reset or ''
     
     local prompt_parts = {
         _cache.git_duration,
-        git_prompt,
+        _cache.git_render,
         stash_prompt,
         right_prompt_time,
     }
