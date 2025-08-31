@@ -305,21 +305,12 @@ local function fmt_duration(s)
 end
 
 -- measure the duration of last run command
-local last_start, last_dur_s, right_prompt_time
+local last_start, last_dur_s
 if clink and clink.onbeginedit then
     clink.onbeginedit(function ()
         if last_start then
             last_dur_s = clock() - last_start
             last_start = nil
-        end
-        
-        right_prompt_time = config.color.now .. os.date('%H:%M:%S') .. config.color.reset
-        
-        local d = fmt_duration(last_dur_s)
-        if d ~= '' then
-            local MINIMAL_WIDTH = 5
-            if #d < MINIMAL_WIDTH then d = format('%5s', d) end
-            right_prompt_time = config.color.took .. d .. ' ' .. right_prompt_time
         end
     end)
 end
@@ -373,6 +364,16 @@ local function git_left_prompt()
     return concat(prompt_parts, ' ')
 end
 
+local function fmt_last_cmd_duration()
+    local d = fmt_duration(last_dur_s)
+    if not d or d=='' then return '' end
+    
+    local MINIMAL_WIDTH = 5
+    if #d < MINIMAL_WIDTH then d = format('%5s', d) end
+    
+    return config.color.took .. d .. config.color.clean
+end
+
 local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
 -- left prompt, first in execution line so it contains async promptcoroutine
@@ -406,13 +407,15 @@ end
 -- it uses cached values provided by the left prompt after its async call
 function pf:rightfilter()
     local stash_count = getstashcount()
-    local stash_prompt = (stash_count>0) and config.color.clean..(config.status_format.stashed):format(stash_count)..config.color.reset or ''
+    local stash_prompt = (stash_count>0) and config.color.clean .. (config.status_format.stashed):format(stash_count) .. config.color.reset or ''
+    local right_prompt_time = config.color.now .. os.date('%H:%M:%S') .. config.color.reset
     
     local prompt_parts = {
         _cache.git_duration,
         _cache.git_render,
         stash_prompt,
-        right_prompt_time,
+        fmt_last_cmd_duration(),
+        right_prompt_time
     }
     
     return concat(clean(prompt_parts), ' ')
