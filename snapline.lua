@@ -145,21 +145,11 @@ end
 
 local function getstashsizepath()
     local gd = git.getgitdir()
-    if not gd then
-        _cache.stash_path = nil
-        _cache.stash_size = nil
-        _cache.stash_count = 0
-        return nil, nil
-    end
+    if not gd then return nil, nil end
     
     local stashpath = gd .. '\\logs\\refs\\stash'
     local f = io.open(stashpath, 'rb')
-    if not f then
-        _cache.stash_path = nil
-        _cache.stash_size = nil
-        _cache.stash_count = 0
-        return nil, nil
-    end
+    if not f then return nil, nil end
     
     -- getting file size is super quick, use opportunity to get it here
     local sz = f:seek('end')
@@ -176,7 +166,7 @@ end
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
     local sz, stashpath = getstashsizepath()
-    if not stashpath then return 0 end
+    if not sz or not stashpath then return 0 end
     
     -- return cached stash count if cache is of the same path and stash file size
     if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
