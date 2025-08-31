@@ -378,12 +378,10 @@ local pf = clink.promptfilter(FILTER_PRIORITY)
 -- left prompt, first in execution line so it contains async promptcoroutine
 function pf:filter()
     local response = clink.promptcoroutine(profile)
-    if response then
-        if response.info then
-            _cache.dirty_branch = response.info.dirty_branch
-            _cache.dirty_dir    = response.info.dirty_dir
-            _cache.git_render   = git_render(response.info)
-        end
+    if response and response.info then
+        _cache.dirty_branch = response.info.dirty_branch
+        _cache.dirty_dir    = response.info.dirty_dir
+        _cache.git_render   = git_render(response.info)
     end
     if config.profile and response and response.duration then
         _cache.git_duration = fmt_duration(response.duration)
