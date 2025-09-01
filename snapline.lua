@@ -51,12 +51,22 @@ local config = {
     
     branch_symbol = '\238\130\160',     -- UTF-8 code for branch glyph
     color = {
-        venv = '\x1b[33m',              -- yellow
+        -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+        -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
+        -- CSI Pm m, Ps = 3 3  =>  Set foreground color to Yellow.
+        -- CSI Pm m, Ps = 3 2  =>  Set foreground color to Green.
+        venv  = '\x1b[33m',             -- yellow
         state = '\x1b[33m',             -- yellow
         clean = '\x1b[32m',             -- green
+        -- Ps = 3 8 : 2 : Pi : Pr : Pg : Pb  =>  Set foreground color
+        -- using RGB values. If xterm is not compiled with direct-color
+        -- support, it uses the closest match in its palette for the
+        -- given RGB Pr/Pg/Pb. The color space identifier Pi is ignored.
         dirty = '\x1b[38;2;200;90;90m', -- red
+        -- Ps = 3 8 : 5 : Ps  =>  Set foreground color to Ps, using indexed color.
         took  = '\x1b[38;5;242m',       -- gray (bright black)
         now   = '\x1b[38;5;109m',       -- dim cyan
+        -- Ps = 0  =>  Normal (default), VT100.
         reset = '\x1b[0m',
     },
     -- https://chrisant996.github.io/clink/clink.html#git.getstatus
@@ -423,6 +433,9 @@ end
 function pf:surround()
     -- clear line code before left prompt to clean entire line (left & right) before prompt render
     -- otherwise stray glyphs can persist if left prompt gets shorter after async call
+    -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+    -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
+    -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
     local CLEAR_LINE = '\x1b[2K'
     -- prefix, suffix, rprefix, rsuffix
     return CLEAR_LINE, '', '', ''
