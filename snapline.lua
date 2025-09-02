@@ -49,7 +49,7 @@ local config = {
     --     list('\U000f140b'.encode('utf-8'))           >  [243, 177, 144, 139]
     --     bytes([243, 177, 144, 139]).decode('utf-8')  >  '\U000f140b'
     
-    branch_symbol = '\238\130\160',     -- UTF-8 code for branch glyph
+    branch_symbol = '\238\130\160',  -- UTF-8 code for branch glyph, UTF-16 is 'e0a0'
     color = {
         -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
         -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
@@ -74,7 +74,7 @@ local config = {
         diverged   = '⇕',    -- if ahead and behind at the same time
         ahead      = '⇡%d',
         behind     = '⇣%d',
-        conflicted = '\243\177\144\139%d',  -- UTF-8 code for thunder glyph
+        conflicted = '\243\177\144\139%d',  -- UTF-8 code for thunder glyph, UTF-16 is 'f140b'
         staged     = '+%d',
         modified   = '!%d',
         renamed    = '»%d',
@@ -88,13 +88,13 @@ local config = {
     action_symbol = {
         rebase_i       = 'Ri',
         rebase_m       = 'Rm',
-        rebase         = '\239\129\162',
-        am             = '\238\172\156',
+        rebase         = '\239\129\162',      -- UTF-16 is 'f062'
+        am             = '\238\172\156',      -- UTF-16 is 'eb1c'
         am_rebase      = 'amR',
-        merging        = '\243\176\189\156',
-        cherry_picking = '\238\138\155',
-        reverting      = '\239\129\160',
-        bisecting      = '\243\176\135\148',
+        merging        = '\243\176\189\156',  -- UTF-16 is 'f0f5c'
+        cherry_picking = '\238\138\155',      -- UTF-16 is 'e29b'
+        reverting      = '\239\129\160',      -- UTF-16 is 'f060'
+        bisecting      = '\243\176\135\148',  -- UTF-16 is 'f01d4'
         unknown        = '?',
     },
     profile = false,
