@@ -10,12 +10,19 @@ local concat = table.concat
 local floor  = math.floor
 local format = string.format
 local getenv = os.getenv
+local date   = os.date
+
+local CMD_DURATION_CLOCK_PRECISION = 1e-6
+local MIN_CMD_DURATION_WIDTH = 5
+local ACTION_KEY_FORBIDDEN_SYMBOLS = '[-/]'
+local CLEAR_LINE = '\x1b[2K'
 
 -- cached values used for fast prompt render to keep CLI snappy
 -- every use of cached value is refreshed upon async op finish
 local function get_init_cache()
     return {
         cwd = '',
+        venv = nil,
         stash_path = nil,
         stash_size = nil,
         stash_count = 0,
@@ -26,14 +33,6 @@ local function get_init_cache()
     }
 end
 local _cache = get_init_cache()
--- invalidate cache on dir change
-clink.onbeginedit(function ()
-    local cwd = getenv('CD') or ''
-    if cwd ~= _cache.cwd then
-        _cache = get_init_cache()
-        _cache.cwd = cwd
-    end
-end)
 
 local config = {
     -- Nerd Fonts tables: https://www.nerdfonts.com/cheat-sheet
@@ -100,15 +99,11 @@ local config = {
     profile = false,
 }
 
--- remove nil and '' elements from a table
-local function clean(t)
-    local out = {}
-    
-    for _, s in ipairs(t) do
-        if s and s ~= '' then out[#out+1] = s end
+-- append value to table only if it is not nil/empty
+local function append_non_empty(t, s)
+    if s and s ~= '' then
+        t[#t + 1] = s
     end
-    
-    return out
 end
 
 -- recursive walk and format Lua table
@@ -153,45 +148,68 @@ local function venv_name()
     return nil
 end
 
-local function getstashsizepath()
+-- invalidate cache on dir change and refresh env-dependent values
+clink.onbeginedit(function ()
+    local cwd = getenv('CD') or ''
+    if cwd ~= _cache.cwd then
+        _cache = get_init_cache()
+        _cache.cwd = cwd
+    end
+    _cache.venv = venv_name()
+end)
+
+local function openstashlog()
     local gd = git.getgitdir()
-    if not gd then return nil, nil end
+    if not gd then return nil, nil, nil end
     
     local stashpath = gd .. '\\logs\\refs\\stash'
     local f = io.open(stashpath, 'rb')
-    if not f then return nil, nil end
+    if not f then return nil, nil, nil end
     
-    -- getting file size is super quick, use opportunity to get it here
+    -- seek is fast and lets us skip reading when size is unchanged
     local sz = f:seek('end')
-    f:close()
+    if not sz then
+        f:close()
+        return nil, nil, nil
+    end
     
-    return sz, stashpath
+    return f, sz, stashpath
 end
 
 -- fast stash check based on checking if .git\logs\refs\stash is empty
 local function hasstash()
-    return (getstashsizepath() or 0) > 0
+    local f, sz = openstashlog()
+    if f then f:close() end
+    return (sz or 0) > 0
 end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local sz, stashpath = getstashsizepath()
-    if not sz or not stashpath then return 0 end
+    local f, sz, stashpath = openstashlog()
+    if not f or not sz or not stashpath then
+        _cache.stash_size = nil
+        _cache.stash_path = nil
+        _cache.stash_count = 0
+        return 0
+    end
     
     -- return cached stash count if cache is of the same path and stash file size
     if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
+        f:close()
         return _cache.stash_count
     end
     _cache.stash_size = sz
     _cache.stash_path = stashpath
     
-    local f = io.open(stashpath, 'rb')
-    if not f then
+    if sz == 0 then
         _cache.stash_count = 0
-    else    
-        _, _cache.stash_count = f:read('*a'):gsub('\n', '\n')
         f:close()
+        return 0
     end
+
+    f:seek('set', 0)
+    _, _cache.stash_count = f:read('*a'):gsub('\n', '\n')
+    f:close()
     
     return _cache.stash_count
 end
@@ -299,8 +317,7 @@ local function git_render(info)
 end
 
 local function fmt_duration(s)
-    local CLOCK_PRECISION = 1e-6  -- Clink clock returning seconds with us precision
-    if not s or s < CLOCK_PRECISION then return '' end
+    if not s or s < CMD_DURATION_CLOCK_PRECISION then return '' end
     
     if s < 1e-3 then return format('%.0fµs', s*1000000) end
     if s < 1    then return format('%.0fms', s*1000) end
@@ -365,8 +382,7 @@ local function git_left_prompt()
     -- rebase-i rebase-m rebase am am/rebase merging cherry-picking reverting bisecting
     local action = git.getaction()
     if action then
-        local FORBIDDEN_SYMBOLS = '[-/]'  -- replace with '_'
-        local action_key = action:gsub(FORBIDDEN_SYMBOLS, '_')
+        local action_key = action:gsub(ACTION_KEY_FORBIDDEN_SYMBOLS, '_')
         local symbol = config.action_symbol[action_key] or config.action_symbol.unknown
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
@@ -378,8 +394,7 @@ local function fmt_last_cmd_duration()
     local d = fmt_duration(last_dur_s)
     if not d or d=='' then return '' end
     
-    local MINIMAL_WIDTH = 5
-    if #d < MINIMAL_WIDTH then d = format('%5s', d) end
+    if #d < MIN_CMD_DURATION_WIDTH then d = format('%5s', d) end
     
     return config.color.took .. d .. config.color.clean
 end
@@ -403,32 +418,28 @@ function pf:filter()
         dir_color = _cache.dirty_dir and config.color.dirty or config.color.clean
     end
     
-    local venv = venv_name()
-    local prompt_parts = {
-        venv and (config.color.venv .. '{' .. venv .. '}') or '',
-        git_left_prompt(),
-        dir_color..dir_name()..config.color.reset,
-        '> ',
-    }
-    
-    return concat(clean(prompt_parts), ' ')
+    local venv = _cache.venv or venv_name()
+    local prompt_parts = {}
+    append_non_empty(prompt_parts, venv and (config.color.venv .. '{' .. venv .. '}') or '')
+    append_non_empty(prompt_parts, git_left_prompt())
+    append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
+    append_non_empty(prompt_parts, '> ')
+    return concat(prompt_parts, ' ')
 end
 -- right filter, second in execution line so it doesn't contain async calls
 -- it uses cached values provided by the left prompt after its async call
 function pf:rightfilter()
     local stash_count = getstashcount()
     local stash_prompt = (stash_count>0) and config.color.clean .. (config.status_format.stashed):format(stash_count) .. config.color.reset or ''
-    local right_prompt_time = config.color.now .. os.date('%H:%M:%S') .. config.color.reset
-    
-    local prompt_parts = {
-        _cache.git_duration,
-        _cache.git_render,
-        stash_prompt,
-        fmt_last_cmd_duration(),
-        right_prompt_time
-    }
-    
-    return concat(clean(prompt_parts), ' ')
+    local right_prompt_time = config.color.now .. date('%H:%M:%S') .. config.color.reset
+
+    local prompt_parts = {}
+    append_non_empty(prompt_parts, _cache.git_duration)
+    append_non_empty(prompt_parts, _cache.git_render)
+    append_non_empty(prompt_parts, stash_prompt)
+    append_non_empty(prompt_parts, fmt_last_cmd_duration())
+    append_non_empty(prompt_parts, right_prompt_time)
+    return concat(prompt_parts, ' ')
 end
 function pf:surround()
     -- clear line code before left prompt to clean entire line (left & right) before prompt render
@@ -436,7 +447,6 @@ function pf:surround()
     -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
     -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
     -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
-    local CLEAR_LINE = '\x1b[2K'
     -- prefix, suffix, rprefix, rsuffix
     return CLEAR_LINE, '', '', ''
 end
