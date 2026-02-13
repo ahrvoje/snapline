@@ -35,7 +35,7 @@ end
 local _cache = get_init_cache()
 
 -- No-op outside Clink prompt runtime.
-if not (clink and git and path and clink.promptfilter and clink.promptcoroutine) then
+if not (clink and git and path and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit and path.getbasename) then
     return
 end
 
@@ -173,7 +173,7 @@ local function join_path(a, b)
 end
 
 local function openstashlog()
-    local gd = git.getcommondir() or git.getgitdir()
+    local gd = (git.getcommondir and git.getcommondir()) or git.getgitdir()
     if not gd then return nil, nil, nil end
     
     local stashpath = join_path(join_path(join_path(gd, 'logs'), 'refs'), 'stash')
@@ -434,7 +434,7 @@ function pf:filter()
         _cache.dirty_dir    = response.info.dirty_dir
         _cache.git_render   = git_render(response.info)
     end
-    if config.profile and response and response.duration then
+    if config.profile and response and response.duration and response.cwd == _cache.cwd then
         _cache.git_duration = fmt_duration(response.duration)
     end
     
