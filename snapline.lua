@@ -19,6 +19,12 @@ local function get_init_cache()
     return {
         cwd = '',
         venv = nil,
+        git_upstream_key = nil,
+        git_upstream_prompt = '',
+        python_prompt = '',
+        pyvenv_cfg_path = nil,
+        pyvenv_cfg_size = nil,
+        pyvenv_version = nil,
         stash_path = nil,
         stash_size = nil,
         stash_count = 0,
@@ -189,6 +195,139 @@ local function get_cwd()
     return getenv('CD') or getenv('PWD') or ''
 end
 
+local PATH_SEP = (package and package.config and package.config:sub(1, 1)) or '\\'
+local function join_path(a, b)
+    return a .. PATH_SEP .. b
+end
+
+local function extract_python_version(s)
+    if not s or #s == 0 then
+        return nil
+    end
+    local v = s:match('(%d+%.%d+%.%d+)') or s:match('(%d+%.%d+)')
+    if not v then
+        return nil
+    end
+    local major, minor = v:match('^(%d+)%.(%d+)')
+    if major and minor then
+        return major .. '.' .. minor
+    end
+    return v
+end
+
+local function get_cached_pyvenv_version(venv_root)
+    if not venv_root or #venv_root == 0 then
+        _cache.pyvenv_cfg_path = nil
+        _cache.pyvenv_cfg_size = nil
+        _cache.pyvenv_version = nil
+        return nil
+    end
+    
+    local cfg_path = join_path(venv_root, 'pyvenv.cfg')
+    local f = io.open(cfg_path, 'rb')
+    if not f then
+        _cache.pyvenv_cfg_path = cfg_path
+        _cache.pyvenv_cfg_size = nil
+        _cache.pyvenv_version = nil
+        return nil
+    end
+    
+    local sz = f:seek('end')
+    if sz and cfg_path == _cache.pyvenv_cfg_path and sz == _cache.pyvenv_cfg_size then
+        f:close()
+        return _cache.pyvenv_version
+    end
+    if not sz then
+        f:close()
+        _cache.pyvenv_cfg_path = cfg_path
+        _cache.pyvenv_cfg_size = nil
+        _cache.pyvenv_version = nil
+        return nil
+    end
+    
+    f:seek('set', 0)
+    local content = f:read('*a')
+    f:close()
+    
+    local ver = nil
+    if content then
+        local raw = content:match('^%s*version%s*=%s*([^\r\n]+)') or
+            content:match('[\r\n]%s*version%s*=%s*([^\r\n]+)') or
+            content:match('^%s*version_info%s*=%s*([^\r\n]+)') or
+            content:match('[\r\n]%s*version_info%s*=%s*([^\r\n]+)')
+        ver = extract_python_version(raw)
+    end
+    
+    _cache.pyvenv_cfg_path = cfg_path
+    _cache.pyvenv_cfg_size = sz
+    _cache.pyvenv_version = ver
+    return ver
+end
+
+local function refresh_python_capsule()
+    local source = nil
+    local version = extract_python_version(getenv('PYTHON_VERSION')) or extract_python_version(getenv('UV_PYTHON'))
+    
+    local venv_root = getenv('VIRTUAL_ENV')
+    if venv_root and #venv_root > 0 then
+        source = getenv('UV_ACTIVE') and 'uv' or 'venv'
+        version = get_cached_pyvenv_version(venv_root) or version
+    else
+        local conda_env = normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
+        if conda_env then
+            source = 'conda'
+        else
+            local pyenv = normalize_env_name(getenv('PYENV_VERSION'))
+            if pyenv then
+                source = 'pyenv'
+                version = extract_python_version(pyenv) or version
+            elseif getenv('UV_ACTIVE') then
+                source = 'uv'
+            end
+        end
+    end
+    
+    if not source then
+        _cache.python_prompt = ''
+        return
+    end
+    
+    local capsule = 'py'
+    if version then
+        capsule = capsule .. version
+    end
+    capsule = capsule .. ':' .. source
+    _cache.python_prompt = config.color.venv .. capsule .. config.color.reset
+end
+
+local function refresh_git_upstream_capsule()
+    if not git.isgitdir() then
+        _cache.git_upstream_key = nil
+        _cache.git_upstream_prompt = ''
+        return
+    end
+    
+    local remote = (git.getremote and git.getremote()) or nil
+    local branch = (git.getbranch and git.getbranch()) or nil
+    if not remote or #remote == 0 then
+        _cache.git_upstream_key = nil
+        _cache.git_upstream_prompt = ''
+        return
+    end
+    
+    local key = remote .. '|' .. (branch or '')
+    if key == _cache.git_upstream_key then
+        return
+    end
+    _cache.git_upstream_key = key
+    
+    local upstream = remote
+    if branch and #branch > 0 then
+        upstream = upstream .. '/' .. branch
+    end
+    _cache.git_upstream_prompt = config.color.now .. upstream .. config.color.reset
+end
+
 -- refresh cache only on prompt boundaries, not every filter render
 local function refresh_runtime_cache()
     local cwd = get_cwd()
@@ -197,14 +336,11 @@ local function refresh_runtime_cache()
         _cache.cwd = cwd
     end
     _cache.venv = venv_name()
+    refresh_python_capsule()
+    refresh_git_upstream_capsule()
 end
 refresh_runtime_cache()
 clink.onbeginedit(refresh_runtime_cache)
-
-local PATH_SEP = (package and package.config and package.config:sub(1, 1)) or '\\'
-local function join_path(a, b)
-    return a .. PATH_SEP .. b
-end
 
 local function openstashlog()
     local gd = (git.getcommondir and git.getcommondir()) or git.getgitdir()
@@ -512,7 +648,9 @@ function pf:rightfilter()
     local prompt_parts = {}
     append_non_empty(prompt_parts, _cache.git_duration)
     append_non_empty(prompt_parts, _cache.git_render)
+    append_non_empty(prompt_parts, _cache.git_upstream_prompt)
     append_non_empty(prompt_parts, stash_prompt)
+    append_non_empty(prompt_parts, _cache.python_prompt)
     append_non_empty(prompt_parts, fmt_last_cmd_duration())
     append_non_empty(prompt_parts, right_prompt_time)
     return concat(prompt_parts, ' ')
@@ -521,8 +659,10 @@ function pf:surround()
     -- clear line code before left prompt to clean entire line (left & right) before prompt render
     -- otherwise stray glyphs can persist if left prompt gets shorter after async call
     -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+
     -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
     -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
+
     -- prefix, suffix, rprefix, rsuffix
     return '\x1b[2K', '', '', ''
 end
