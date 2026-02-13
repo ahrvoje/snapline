@@ -35,7 +35,7 @@ end
 local _cache = get_init_cache()
 
 -- No-op outside Clink prompt runtime.
-if not (clink and git and path and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit and path.getbasename) then
+if not (clink and git and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit) then
     return
 end
 
@@ -132,23 +132,58 @@ end
 --     return concat(o)
 -- end
 
+local function basename_any_path(p)
+    if not p or #p == 0 then
+        return nil
+    end
+    local s = p:gsub('[\\/]+$', '')
+    if #s == 0 then
+        return nil
+    end
+    local b = s:match('([^\\/]+)$')
+    if b and #b > 0 then
+        return b
+    end
+    return nil
+end
+
+local function normalize_env_name(s)
+    if not s or #s == 0 then
+        return nil
+    end
+    s = s:gsub('^%s+', ''):gsub('%s+$', '')
+    if #s == 0 then
+        return nil
+    end
+    local inner = s:match('^%((.-)%)$')
+    if inner and #inner > 0 then
+        s = inner
+    end
+    s = s:gsub('^%s+', ''):gsub('%s+$', '')
+    if #s == 0 then
+        return nil
+    end
+    return s
+end
+
 -- extract venv name from env vars
 local function venv_name()
-    local v = getenv('VIRTUAL_ENV')
-    if v and #v > 0 then return path.getbasename(v) end
+    -- python venv: prompt override is most explicit and works cross-platform
+    local vp = normalize_env_name(getenv('VIRTUAL_ENV_PROMPT'))
+    if vp then return vp end
+
+    local v = basename_any_path(getenv('VIRTUAL_ENV'))
+    if v then return v end
     
     -- conda
-    local cpm = getenv('CONDA_PROMPT_MODIFIER')
-    if cpm and #cpm > 0 then
-        local s = cpm:gsub('^%s*%(', ''):gsub('%)%s*$', '')
-        if #s > 0 then return s end
-    end
-    local c = getenv('CONDA_DEFAULT_ENV')
-    if c and #c > 0 then return c end
+    local cpm = normalize_env_name(getenv('CONDA_PROMPT_MODIFIER'))
+    if cpm then return cpm end
+    local c = normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
+    if c then return c end
     
-    -- python
-    local pv = getenv('PYENV_VERSION')
-    if pv and #pv > 0 then return pv end
+    -- pyenv
+    local pv = normalize_env_name(getenv('PYENV_VERSION'))
+    if pv then return pv end
     
     return nil
 end
@@ -157,15 +192,17 @@ local function get_cwd()
     return getenv('CD') or getenv('PWD') or ''
 end
 
--- invalidate cache on dir change and refresh env-dependent values
-clink.onbeginedit(function ()
+-- refresh cache only on prompt boundaries, not every filter render
+local function refresh_runtime_cache()
     local cwd = get_cwd()
     if cwd ~= _cache.cwd then
         _cache = get_init_cache()
         _cache.cwd = cwd
     end
     _cache.venv = venv_name()
-end)
+end
+refresh_runtime_cache()
+clink.onbeginedit(refresh_runtime_cache)
 
 local PATH_SEP = (package and package.config and package.config:sub(1, 1)) or '\\'
 local function join_path(a, b)
@@ -373,7 +410,7 @@ end
 
 local function dir_name()
     local cwd = _cache.cwd
-    local base = path.getbasename(cwd)
+    local base = basename_any_path(cwd)
     if base and #base > 0 then return base end
     
     -- at drive root give readable name, e.g. for 'C:\' give 'C:'
@@ -443,9 +480,11 @@ function pf:filter()
         dir_color = _cache.dirty_dir and config.color.dirty or config.color.clean
     end
     
-    local venv = _cache.venv or venv_name()
+    local venv = _cache.venv
     local prompt_parts = {}
-    append_non_empty(prompt_parts, venv and (config.color.venv .. '{' .. venv .. '}') or '')
+    if venv and #venv > 0 then
+        append_non_empty(prompt_parts, config.color.venv .. '{' .. venv .. '}')
+    end
     append_non_empty(prompt_parts, git_left_prompt())
     append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
     append_non_empty(prompt_parts, '> ')
