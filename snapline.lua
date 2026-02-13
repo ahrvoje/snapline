@@ -114,26 +114,34 @@ local function append_non_empty(t, s)
     end
 end
 
--- recursive walk and format Lua table
--- local function prettyformat(t,i,s)
---     if not t then return '' end
---     
---     i = i or ''
---     s = s or {}
---     if s[t] then return '<cycle>' end s[t]=1
---     
---     local o = {'{'}
---     for k, v in pairs(t) do
---         k = type(k)=='string' and format('%q', k) or tostring(k)
---         v = type(v)=='table' and prettyformat(v, i..'  ', s) or (type(v)=='string' and format('%q', v) or tostring(v))
---         o[#o+1] = ('\n%s  [%s]=%s,'):format(i, k, v)
---     end
---     
---     s[t] = nil
---     o[#o+1] = '\n'..i..'}'
---     
---     return concat(o)
--- end
+local function trim(s)
+    if not s then
+        return nil
+    end
+    s = s:match('^%s*(.-)%s*$')
+    return s ~= '' and s or nil
+end
+
+local function to_int(v)
+    return tonumber(v) or 0
+end
+
+local function set_pyvenv_cache(path, size, version)
+    _cache.pyvenv_cfg_path = path
+    _cache.pyvenv_cfg_size = size
+    _cache.pyvenv_version = version
+end
+
+local function clear_git_upstream_cache()
+    _cache.git_upstream_key = nil
+    _cache.git_upstream_prompt = ''
+end
+
+local function set_stash_cache(path, size, count)
+    _cache.stash_path = path
+    _cache.stash_size = size
+    _cache.stash_count = count or 0
+end
 
 local function basename_any_path(p)
     if not p or #p == 0 then
@@ -151,44 +159,20 @@ local function basename_any_path(p)
 end
 
 local function normalize_env_name(s)
-    if not s or #s == 0 then
-        return nil
-    end
-    s = s:gsub('^%s+', ''):gsub('%s+$', '')
-    if #s == 0 then
-        return nil
-    end
-    local inner = s:match('^%((.-)%)$')
-    if inner and #inner > 0 then
-        s = inner
-    end
-    s = s:gsub('^%s+', ''):gsub('%s+$', '')
-    if #s == 0 then
-        return nil
-    end
-    return s
+    s = trim(s)
+    if not s then return nil end
+
+    local inner = s:match('^%((.+)%)$')
+    return trim(inner or s)
 end
 
 -- extract venv name from env vars
 local function venv_name()
-    -- python venv: prompt override is most explicit and works cross-platform
-    local vp = normalize_env_name(getenv('VIRTUAL_ENV_PROMPT'))
-    if vp then return vp end
-
-    local v = basename_any_path(getenv('VIRTUAL_ENV'))
-    if v then return v end
-    
-    -- conda
-    local cpm = normalize_env_name(getenv('CONDA_PROMPT_MODIFIER'))
-    if cpm then return cpm end
-    local c = normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
-    if c then return c end
-    
-    -- pyenv
-    local pv = normalize_env_name(getenv('PYENV_VERSION'))
-    if pv then return pv end
-    
-    return nil
+    return normalize_env_name(getenv('VIRTUAL_ENV_PROMPT'))
+        or basename_any_path(getenv('VIRTUAL_ENV'))
+        or normalize_env_name(getenv('CONDA_PROMPT_MODIFIER'))
+        or normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
+        or normalize_env_name(getenv('PYENV_VERSION'))
 end
 
 local function get_cwd()
@@ -217,18 +201,14 @@ end
 
 local function get_cached_pyvenv_version(venv_root)
     if not venv_root or #venv_root == 0 then
-        _cache.pyvenv_cfg_path = nil
-        _cache.pyvenv_cfg_size = nil
-        _cache.pyvenv_version = nil
+        set_pyvenv_cache(nil, nil, nil)
         return nil
     end
     
     local cfg_path = join_path(venv_root, 'pyvenv.cfg')
     local f = io.open(cfg_path, 'rb')
     if not f then
-        _cache.pyvenv_cfg_path = cfg_path
-        _cache.pyvenv_cfg_size = nil
-        _cache.pyvenv_version = nil
+        set_pyvenv_cache(cfg_path, nil, nil)
         return nil
     end
     
@@ -239,9 +219,7 @@ local function get_cached_pyvenv_version(venv_root)
     end
     if not sz then
         f:close()
-        _cache.pyvenv_cfg_path = cfg_path
-        _cache.pyvenv_cfg_size = nil
-        _cache.pyvenv_version = nil
+        set_pyvenv_cache(cfg_path, nil, nil)
         return nil
     end
     
@@ -258,9 +236,7 @@ local function get_cached_pyvenv_version(venv_root)
         ver = extract_python_version(raw)
     end
     
-    _cache.pyvenv_cfg_path = cfg_path
-    _cache.pyvenv_cfg_size = sz
-    _cache.pyvenv_version = ver
+    set_pyvenv_cache(cfg_path, sz, ver)
     return ver
 end
 
@@ -302,16 +278,14 @@ end
 
 local function refresh_git_upstream_capsule()
     if not git.isgitdir() then
-        _cache.git_upstream_key = nil
-        _cache.git_upstream_prompt = ''
+        clear_git_upstream_cache()
         return
     end
     
     local remote = (git.getremote and git.getremote()) or nil
     local branch = (git.getbranch and git.getbranch()) or nil
     if not remote or #remote == 0 then
-        _cache.git_upstream_key = nil
-        _cache.git_upstream_prompt = ''
+        clear_git_upstream_cache()
         return
     end
     
@@ -360,20 +334,11 @@ local function openstashlog()
     return f, sz, stashpath
 end
 
--- fast stash check based on checking if .git\logs\refs\stash is empty
-local function hasstash()
-    local f, sz = openstashlog()
-    if f then f:close() end
-    return (sz or 0) > 0
-end
-
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
     local f, sz, stashpath = openstashlog()
     if not f or not sz or not stashpath then
-        _cache.stash_size = nil
-        _cache.stash_path = nil
-        _cache.stash_count = 0
+        set_stash_cache(nil, nil, 0)
         return 0
     end
     
@@ -382,11 +347,10 @@ local function getstashcount()
         f:close()
         return _cache.stash_count
     end
-    _cache.stash_size = sz
-    _cache.stash_path = stashpath
+    set_stash_cache(stashpath, sz, _cache.stash_count)
     
     if sz == 0 then
-        _cache.stash_count = 0
+        set_stash_cache(stashpath, sz, 0)
         f:close()
         return 0
     end
@@ -394,11 +358,12 @@ local function getstashcount()
     f:seek('set', 0)
     local stash_content = f:read('*a')
     if not stash_content then
-        _cache.stash_count = 0
+        set_stash_cache(stashpath, sz, 0)
         f:close()
         return 0
     end
-    _, _cache.stash_count = stash_content:gsub('\n', '\n')
+    local _, count = stash_content:gsub('\n', '\n')
+    set_stash_cache(stashpath, sz, count)
     f:close()
     
     return _cache.stash_count
@@ -406,13 +371,9 @@ end
 
 local function refresh_stash_cache()
     local stash_count = getstashcount()
-    if stash_count > 0 then
-        _cache.stash_prompt = config.color.clean ..
-            (config.status_format.stashed):format(stash_count) ..
-            config.color.reset
-    else
-        _cache.stash_prompt = ''
-    end
+    _cache.stash_prompt = stash_count > 0
+        and (config.color.clean .. (config.status_format.stashed):format(stash_count) .. config.color.reset)
+        or ''
 end
 refresh_stash_cache()
 clink.onbeginedit(refresh_stash_cache)
@@ -438,10 +399,6 @@ clink.onbeginedit(refresh_stash_cache)
 --
 local function collect_status()
     if not git.isgitdir() then return nil end
-    
-    local function n(v)
-        return tonumber(v) or 0
-    end
 
     local info = {
         ahead        = 0,
@@ -460,40 +417,39 @@ local function collect_status()
     -- arg1: ignore untracked, arg2: include submodules
     local status = git.getstatus(false, false)
     if not status then return nil end
-    -- print(prettyformat(status))  -- for debugging
     
     info.dirty_branch = status.dirty and true or false
     
     -- ahead/behind (numbers or nil)
-    info.ahead  = n(status.ahead)
-    info.behind = n(status.behind)
+    info.ahead  = to_int(status.ahead)
+    info.behind = to_int(status.behind)
     
     -- file counts
-    info.conflicted = n(status.conflict)
-    info.tracked    = n(status.tracked)
-    info.untracked  = n(status.untracked)
+    info.conflicted = to_int(status.conflict)
+    info.tracked    = to_int(status.tracked)
+    info.untracked  = to_int(status.untracked)
     info.dirty_dir  = info.untracked > 0 or false
     
     -- working tree modifications
     if status.working then
-        info.modified = n(status.working.modify)
+        info.modified = to_int(status.working.modify)
         -- also exists status.working.untracked
     end
     
     -- staged changes; sum add/modify/delete/rename (copy is folded into rename)
     if status.staged then
         local s = 0
-        s = s + n(status.staged.add)
-        s = s + n(status.staged.modify)
-        s = s + n(status.staged.delete)
-        s = s + n(status.staged.rename)
+        s = s + to_int(status.staged.add)
+        s = s + to_int(status.staged.modify)
+        s = s + to_int(status.staged.delete)
+        s = s + to_int(status.staged.rename)
         info.staged  = s
-        info.renamed = n(status.staged.rename)
+        info.renamed = to_int(status.staged.rename)
     end
     
     -- unique deletes across working+index
     if status.total and status.total.delete then
-        info.deleted = n(status.total.delete)
+        info.deleted = to_int(status.total.delete)
     end
     
     return info
@@ -502,25 +458,25 @@ end
 -- stringify git status info
 local function git_render(info)
     local fmt = config.status_format
-    
-    local s = {}
+
+    local parts = {}
     if info.ahead > 0 or info.behind > 0 then
-        s[#s+1] = (info.ahead>0  and info.behind>0 and fmt.diverged   or '') ..
-                  (info.ahead>0  and (fmt.ahead):format(info.ahead)   or '') ..
-                  (info.behind>0 and (fmt.behind):format(info.behind) or '')
+        parts[#parts + 1] = (info.ahead > 0 and info.behind > 0 and fmt.diverged or '') ..
+            (info.ahead > 0 and (fmt.ahead):format(info.ahead) or '') ..
+            (info.behind > 0 and (fmt.behind):format(info.behind) or '')
     end
-    if info.conflicted > 0 then s[#s+1] = (fmt.conflicted):format(info.conflicted) end
-    if info.modified   > 0 then s[#s+1] = (fmt.modified):format(info.modified)     end
-    if info.renamed    > 0 then s[#s+1] = (fmt.renamed):format(info.renamed)       end
-    if info.deleted    > 0 then s[#s+1] = (fmt.deleted):format(info.deleted)       end
-    if info.staged     > 0 then s[#s+1] = (fmt.staged):format(info.staged)         end
-    if info.tracked    > 0 then s[#s+1] = (fmt.tracked):format(info.tracked)       end
-    if info.untracked  > 0 then s[#s+1] = (fmt.untracked):format(info.untracked)   end
+    if info.conflicted > 0 then parts[#parts + 1] = (fmt.conflicted):format(info.conflicted) end
+    if info.modified > 0 then parts[#parts + 1] = (fmt.modified):format(info.modified) end
+    if info.renamed > 0 then parts[#parts + 1] = (fmt.renamed):format(info.renamed) end
+    if info.deleted > 0 then parts[#parts + 1] = (fmt.deleted):format(info.deleted) end
+    if info.staged > 0 then parts[#parts + 1] = (fmt.staged):format(info.staged) end
+    if info.tracked > 0 then parts[#parts + 1] = (fmt.tracked):format(info.tracked) end
+    if info.untracked > 0 then parts[#parts + 1] = (fmt.untracked):format(info.untracked) end
     
     -- render must not be empty string or right prompt doesn't get redrawn after async!
     -- so if git info is empty still return it wrapped in colors - don't simplify to ''
     local color = info.dirty_branch and config.color.dirty or config.color.clean
-    return color .. concat(s, ' ') .. config.color.reset
+    return color .. concat(parts, ' ') .. config.color.reset
 end
 
 local function fmt_duration(s)
@@ -602,7 +558,7 @@ end
 
 local function fmt_last_cmd_duration()
     local d = fmt_duration(last_dur_s)
-    if not d or d=='' then return '' end
+    if d == '' then return '' end
     
     -- limit command time duration width to 5 characters
     if #d < 5 then d = format('%5s', d) end
@@ -631,9 +587,7 @@ function pf:filter()
     
     local venv = _cache.venv
     local prompt_parts = {}
-    if venv and #venv > 0 then
-        append_non_empty(prompt_parts, config.color.venv .. '{' .. venv .. '}')
-    end
+    append_non_empty(prompt_parts, (venv and #venv > 0) and (config.color.venv .. '{' .. venv .. '}') or nil)
     append_non_empty(prompt_parts, git_left_prompt())
     append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
     append_non_empty(prompt_parts, '> ')
