@@ -34,6 +34,11 @@ local function get_init_cache()
 end
 local _cache = get_init_cache()
 
+-- No-op outside Clink prompt runtime.
+if not (clink and git and path and clink.promptfilter and clink.promptcoroutine) then
+    return
+end
+
 local config = {
     -- Nerd Fonts tables: https://www.nerdfonts.com/cheat-sheet
     --
@@ -148,9 +153,13 @@ local function venv_name()
     return nil
 end
 
+local function get_cwd()
+    return getenv('CD') or getenv('PWD') or ''
+end
+
 -- invalidate cache on dir change and refresh env-dependent values
 clink.onbeginedit(function ()
-    local cwd = getenv('CD') or ''
+    local cwd = get_cwd()
     if cwd ~= _cache.cwd then
         _cache = get_init_cache()
         _cache.cwd = cwd
@@ -158,11 +167,16 @@ clink.onbeginedit(function ()
     _cache.venv = venv_name()
 end)
 
+local PATH_SEP = (package and package.config and package.config:sub(1, 1)) or '\\'
+local function join_path(a, b)
+    return a .. PATH_SEP .. b
+end
+
 local function openstashlog()
-    local gd = git.getgitdir()
+    local gd = git.getcommondir() or git.getgitdir()
     if not gd then return nil, nil, nil end
     
-    local stashpath = gd .. '\\logs\\refs\\stash'
+    local stashpath = join_path(join_path(join_path(gd, 'logs'), 'refs'), 'stash')
     local f = io.open(stashpath, 'rb')
     if not f then return nil, nil, nil end
     
@@ -208,7 +222,13 @@ local function getstashcount()
     end
 
     f:seek('set', 0)
-    _, _cache.stash_count = f:read('*a'):gsub('\n', '\n')
+    local stash_content = f:read('*a')
+    if not stash_content then
+        _cache.stash_count = 0
+        f:close()
+        return 0
+    end
+    _, _cache.stash_count = stash_content:gsub('\n', '\n')
     f:close()
     
     return _cache.stash_count
@@ -235,6 +255,10 @@ end
 --
 local function collect_status()
     if not git.isgitdir() then return nil end
+    
+    local function n(v)
+        return tonumber(v) or 0
+    end
 
     local info = {
         ahead        = 0,
@@ -258,35 +282,35 @@ local function collect_status()
     info.dirty_branch = status.dirty and true or false
     
     -- ahead/behind (numbers or nil)
-    info.ahead  = tonumber(status.ahead)  or 0
-    info.behind = tonumber(status.behind) or 0
+    info.ahead  = n(status.ahead)
+    info.behind = n(status.behind)
     
     -- file counts
-    info.conflicted = status.conflict or 0
-    info.tracked    = status.tracked or 0
-    info.untracked  = status.untracked or 0
+    info.conflicted = n(status.conflict)
+    info.tracked    = n(status.tracked)
+    info.untracked  = n(status.untracked)
     info.dirty_dir  = info.untracked > 0 or false
     
     -- working tree modifications
     if status.working then
-        info.modified = status.working.modify or 0
+        info.modified = n(status.working.modify)
         -- also exists status.working.untracked
     end
     
     -- staged changes; sum add/modify/delete/rename (copy is folded into rename)
     if status.staged then
         local s = 0
-        if status.staged.add    then s = s + status.staged.add    end
-        if status.staged.modify then s = s + status.staged.modify end
-        if status.staged.delete then s = s + status.staged.delete end
-        if status.staged.rename then s = s + status.staged.rename end
+        s = s + n(status.staged.add)
+        s = s + n(status.staged.modify)
+        s = s + n(status.staged.delete)
+        s = s + n(status.staged.rename)
         info.staged  = s
-        info.renamed = status.staged.rename or 0
+        info.renamed = n(status.staged.rename)
     end
     
     -- unique deletes across working+index
     if status.total and status.total.delete then
-        info.deleted = status.total.delete
+        info.deleted = n(status.total.delete)
     end
     
     return info
@@ -358,6 +382,7 @@ end
 
 local function profile()
     local response = {}
+    response.cwd = _cache.cwd
     
     if config.profile then response.duration = clock() end
     response.info = collect_status()
@@ -404,7 +429,7 @@ local pf = clink.promptfilter(FILTER_PRIORITY)
 -- left prompt, first in execution line so it contains async promptcoroutine
 function pf:filter()
     local response = clink.promptcoroutine(profile)
-    if response and response.info then
+    if response and response.info and response.cwd == _cache.cwd then
         _cache.dirty_branch = response.info.dirty_branch
         _cache.dirty_dir    = response.info.dirty_dir
         _cache.git_render   = git_render(response.info)
