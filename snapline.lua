@@ -26,6 +26,7 @@ local function get_init_cache()
         stash_path = nil,
         stash_size = nil,
         stash_count = 0,
+        stash_prompt = '',
         git_render = '',
         git_duration = '',
         dirty_branch = nil,
@@ -271,6 +272,19 @@ local function getstashcount()
     return _cache.stash_count
 end
 
+local function refresh_stash_cache()
+    local stash_count = getstashcount()
+    if stash_count > 0 then
+        _cache.stash_prompt = config.color.clean ..
+            (config.status_format.stashed):format(stash_count) ..
+            config.color.reset
+    else
+        _cache.stash_prompt = ''
+    end
+end
+refresh_stash_cache()
+clink.onbeginedit(refresh_stash_cache)
+
 -- git status table using Clink's git API
 -- potentialy slow function in the focus of the entire story!
 --
@@ -493,8 +507,7 @@ end
 -- right filter, second in execution line so it doesn't contain async calls
 -- it uses cached values provided by the left prompt after its async call
 function pf:rightfilter()
-    local stash_count = getstashcount()
-    local stash_prompt = (stash_count>0) and config.color.clean .. (config.status_format.stashed):format(stash_count) .. config.color.reset or ''
+    local stash_prompt = _cache.stash_prompt or ''
     local right_prompt_time = config.color.now .. date('%H:%M:%S') .. config.color.reset
 
     local prompt_parts = {}
