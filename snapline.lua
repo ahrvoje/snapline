@@ -12,10 +12,6 @@ local format = string.format
 local getenv = os.getenv
 local date   = os.date
 
-local CMD_DURATION_CLOCK_PRECISION = 1e-6
-local MIN_CMD_DURATION_WIDTH = 5
-local ACTION_KEY_FORBIDDEN_SYMBOLS = '[-/]'
-local CLEAR_LINE = '\x1b[2K'
 
 -- cached values used for fast prompt render to keep CLI snappy
 -- every use of cached value is refreshed upon async op finish
@@ -392,7 +388,8 @@ local function git_render(info)
 end
 
 local function fmt_duration(s)
-    if not s or s < CMD_DURATION_CLOCK_PRECISION then return '' end
+    -- clock precision 1e-6
+    if not s or s < 1e-6 then return '' end
     
     if s < 1e-3 then return format('%.0fµs', s*1000000) end
     if s < 1    then return format('%.0fms', s*1000) end
@@ -458,7 +455,8 @@ local function git_left_prompt()
     -- rebase-i rebase-m rebase am am/rebase merging cherry-picking reverting bisecting
     local action = git.getaction()
     if action then
-        local action_key = action:gsub(ACTION_KEY_FORBIDDEN_SYMBOLS, '_')
+        -- forbidden symbols [-/]
+        local action_key = action:gsub('[-/]', '_')
         local symbol = config.action_symbol[action_key] or config.action_symbol.unknown
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
@@ -470,7 +468,8 @@ local function fmt_last_cmd_duration()
     local d = fmt_duration(last_dur_s)
     if not d or d=='' then return '' end
     
-    if #d < MIN_CMD_DURATION_WIDTH then d = format('%5s', d) end
+    -- limit command time duration width to 5 characters
+    if #d < 5 then d = format('%5s', d) end
     
     return config.color.took .. d .. config.color.clean
 end
@@ -525,7 +524,7 @@ function pf:surround()
     -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
     -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
     -- prefix, suffix, rprefix, rsuffix
-    return CLEAR_LINE, '', '', ''
+    return '\x1b[2K', '', '', ''
 end
 
 
