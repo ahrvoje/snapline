@@ -1,8 +1,8 @@
 -- snapline - fast async git status prompt renderer for clink
---     by Hrvoje Abraham ahrvoje@gmail.com
+--         by Hrvoje Abraham ahrvoje@gmail.com
 
--- Legend: conflicted=' |N' ahead=' ⇡N' behind=' ⇣N' diverged=' ⇕⇡A⇣B' tracked=' ?'
---         stashed=' ≡N' modified=' !N' staged=' +N' renamed=' »N' deleted=' XN' untracked=' ??'
+-- Legend:  conflicted=' |N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?'
+--            modified=' !N'     staged=' +N'  deleted=' XN'   ntracked=' ??'     stashed=' ≡N'  renamed=' »N'
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 
 local clock  = os.clock      -- Clink clock returning seconds with us precision
