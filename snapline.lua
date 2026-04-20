@@ -2,7 +2,7 @@
 --         by Hrvoje Abraham ahrvoje@gmail.com
 
 -- Legend:  conflicted=' |N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?'
---            modified=' !N'     staged=' +N'  deleted=' XN'   ntracked=' ??'     stashed=' ≡N'  renamed=' »N'
+--            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??'     stashed=' ≡N'  renamed=' »N'
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 
 local clock  = os.clock      -- Clink clock returning seconds with us precision
@@ -19,6 +19,7 @@ local function get_init_cache()
     return {
         cwd = '',
         venv = nil,
+        git_branch = nil,
         git_upstream_key = nil,
         git_upstream_prompt = '',
         python_prompt = '',
@@ -38,7 +39,7 @@ end
 local _cache = get_init_cache()
 
 -- No-op outside Clink prompt runtime.
-if not (clink and git and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit) then
+if not (clink and git and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit and clink.onendedit) then
     return
 end
 
@@ -133,6 +134,7 @@ local function set_pyvenv_cache(path, size, version)
 end
 
 local function clear_git_upstream_cache()
+    _cache.git_branch = nil
     _cache.git_upstream_key = nil
     _cache.git_upstream_prompt = ''
 end
@@ -284,8 +286,10 @@ local function refresh_git_upstream_capsule()
     
     local remote = (git.getremote and git.getremote()) or nil
     local branch = (git.getbranch and git.getbranch()) or nil
+    _cache.git_branch = branch
     if not remote or #remote == 0 then
-        clear_git_upstream_cache()
+        _cache.git_upstream_key = nil
+        _cache.git_upstream_prompt = ''
         return
     end
     
@@ -334,6 +338,14 @@ local function openstashlog()
     return f, sz, stashpath
 end
 
+-- fast stash presence check: file exists with non-zero size
+local function hasstash()
+    local f, sz = openstashlog()
+    if not f then return false end
+    f:close()
+    return sz ~= nil and sz > 0
+end
+
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
     local f, sz, stashpath = openstashlog()
@@ -347,8 +359,7 @@ local function getstashcount()
         f:close()
         return _cache.stash_count
     end
-    set_stash_cache(stashpath, sz, _cache.stash_count)
-    
+
     if sz == 0 then
         set_stash_cache(stashpath, sz, 0)
         f:close()
@@ -497,19 +508,15 @@ end
 
 -- measure the duration of last run command
 local last_start, last_dur_s
-if clink and clink.onbeginedit then
-    clink.onbeginedit(function ()
-        if last_start then
-            last_dur_s = clock() - last_start
-            last_start = nil
-        end
-    end)
-end
-if clink and clink.onendedit then
-    clink.onendedit(function ()
-        last_start = clock()
-    end)
-end
+clink.onbeginedit(function ()
+    if last_start then
+        last_dur_s = clock() - last_start
+        last_start = nil
+    end
+end)
+clink.onendedit(function ()
+    last_start = clock()
+end)
 
 local function dir_name()
     local cwd = _cache.cwd
@@ -534,7 +541,7 @@ end
 local function git_left_prompt()
     local prompt_parts = {}
     
-    local branch = git.getbranch()
+    local branch = _cache.git_branch
     if branch then
         local branch_color = config.color.reset
         if _cache.dirty_branch ~= nil then
