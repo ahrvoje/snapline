@@ -19,15 +19,19 @@ local function get_init_cache()
     return {
         cwd = '',
         venv = nil,
+        git_dir = nil,
         git_branch = nil,
         git_upstream_key = nil,
         git_upstream_prompt = '',
+        git_untracked_at = nil,
+        git_untracked_count = 0,
         python_prompt = '',
         pyvenv_cfg_path = nil,
         pyvenv_cfg_size = nil,
         pyvenv_version = nil,
         stash_path = nil,
         stash_size = nil,
+        stash_mtime = nil,
         stash_count = 0,
         stash_prompt = '',
         git_render = '',
@@ -99,12 +103,22 @@ local config = {
         rebase         = '\239\129\162',      -- UTF-16 is 'f062'
         am             = '\238\172\156',      -- UTF-16 is 'eb1c'
         am_rebase      = 'amR',
+        merge          = '\243\176\189\156',  -- documented Clink action name
         merging        = '\243\176\189\156',  -- UTF-16 is 'f0f5c'
+        cherry_pick    = '\238\138\155',
         cherry_picking = '\238\138\155',      -- UTF-16 is 'e29b'
+        revert         = '\239\129\160',
         reverting      = '\239\129\160',      -- UTF-16 is 'f060'
+        bisect         = '\243\176\135\148',
         bisecting      = '\243\176\135\148',  -- UTF-16 is 'f01d4'
         unknown        = '?',
     },
+    -- Seconds between full untracked-file scans.  Between full scans, Snapline
+    -- uses "git status -uno" and reuses the last untracked count.  Set to 0 to
+    -- scan untracked files every time, or false to disable untracked counts.
+    untracked_refresh_interval = 2.0,
+    status_include_submodules = false,
+    stash_git_fallback = false,
     profile = false,
 }
 
@@ -133,15 +147,41 @@ local function set_pyvenv_cache(path, size, version)
     _cache.pyvenv_version = version
 end
 
-local function clear_git_upstream_cache()
-    _cache.git_branch = nil
+local function clear_git_status_cache()
     _cache.git_upstream_key = nil
     _cache.git_upstream_prompt = ''
+    _cache.git_untracked_at = nil
+    _cache.git_untracked_count = 0
+    _cache.git_render = ''
+    _cache.git_duration = ''
+    _cache.dirty_branch = nil
+    _cache.dirty_dir = nil
 end
 
-local function set_stash_cache(path, size, count)
+local function clear_git_identity_cache()
+    _cache.git_dir = nil
+    _cache.git_branch = nil
+    clear_git_status_cache()
+end
+
+local function set_git_upstream_cache(upstream)
+    upstream = trim(upstream)
+    if not upstream then
+        _cache.git_upstream_key = nil
+        _cache.git_upstream_prompt = ''
+        return
+    end
+    if upstream == _cache.git_upstream_key then
+        return
+    end
+    _cache.git_upstream_key = upstream
+    _cache.git_upstream_prompt = config.color.now .. upstream .. config.color.reset
+end
+
+local function set_stash_cache(path, size, mtime, count)
     _cache.stash_path = path
     _cache.stash_size = size
+    _cache.stash_mtime = mtime
     _cache.stash_count = count or 0
 end
 
@@ -278,32 +318,26 @@ local function refresh_python_capsule()
     _cache.python_prompt = config.color.venv .. capsule .. config.color.reset
 end
 
-local function refresh_git_upstream_capsule()
-    if not git.isgitdir() then
-        clear_git_upstream_cache()
+local function refresh_git_identity_cache()
+    local gd = (git.getgitdir and git.getgitdir()) or nil
+    if not gd then
+        clear_git_identity_cache()
         return
     end
     
-    local remote = (git.getremote and git.getremote()) or nil
-    local branch = (git.getbranch and git.getbranch()) or nil
-    _cache.git_branch = branch
-    if not remote or #remote == 0 then
-        _cache.git_upstream_key = nil
-        _cache.git_upstream_prompt = ''
-        return
+    if _cache.git_dir and _cache.git_dir ~= gd then
+        clear_git_status_cache()
     end
-    
-    local key = remote .. '|' .. (branch or '')
-    if key == _cache.git_upstream_key then
-        return
+    _cache.git_dir = gd
+    if git.getbranch then
+        local branch = git.getbranch(gd, true)
+        if branch and branch ~= '.invalid' then
+            if _cache.git_branch and _cache.git_branch ~= branch then
+                clear_git_status_cache()
+            end
+            _cache.git_branch = branch
+        end
     end
-    _cache.git_upstream_key = key
-    
-    local upstream = remote
-    if branch and #branch > 0 then
-        upstream = upstream .. '/' .. branch
-    end
-    _cache.git_upstream_prompt = config.color.now .. upstream .. config.color.reset
 end
 
 -- refresh cache only on prompt boundaries, not every filter render
@@ -315,27 +349,42 @@ local function refresh_runtime_cache()
     end
     _cache.venv = venv_name()
     refresh_python_capsule()
-    refresh_git_upstream_capsule()
+    refresh_git_identity_cache()
 end
 refresh_runtime_cache()
 clink.onbeginedit(refresh_runtime_cache)
 
+local function get_file_mtime(p)
+    if not (p and os.findfiles) then
+        return nil
+    end
+
+    local ff = os.findfiles(p, 2, { files = true, dirs = false, hidden = true, system = true, dirsuffix = false })
+    if not ff then
+        return nil
+    end
+
+    local item = ff:next()
+    ff:close()
+    return item and item.mtime or nil
+end
+
 local function openstashlog()
     local gd = (git.getcommondir and git.getcommondir()) or git.getgitdir()
-    if not gd then return nil, nil, nil end
+    if not gd then return nil, nil, nil, nil end
     
     local stashpath = join_path(join_path(join_path(gd, 'logs'), 'refs'), 'stash')
     local f = io.open(stashpath, 'rb')
-    if not f then return nil, nil, nil end
+    if not f then return nil, nil, nil, nil end
     
     -- seek is fast and lets us skip reading when size is unchanged
     local sz = f:seek('end')
     if not sz then
         f:close()
-        return nil, nil, nil
+        return nil, nil, nil, nil
     end
     
-    return f, sz, stashpath
+    return f, sz, stashpath, get_file_mtime(stashpath)
 end
 
 -- fast stash presence check: file exists with non-zero size
@@ -348,20 +397,21 @@ end
 
 -- fast stash count based on counting .git\logs\refs\stash lines
 local function getstashcount()
-    local f, sz, stashpath = openstashlog()
+    local f, sz, stashpath, stash_mtime = openstashlog()
     if not f or not sz or not stashpath then
-        set_stash_cache(nil, nil, 0)
+        set_stash_cache(nil, nil, nil, 0)
         return 0
     end
     
-    -- return cached stash count if cache is of the same path and stash file size
-    if _cache.stash_size and stashpath == _cache.stash_path and sz == _cache.stash_size then
+    -- return cached stash count if cache is of the same path and file metadata
+    if _cache.stash_size and stashpath == _cache.stash_path and
+        sz == _cache.stash_size and stash_mtime == _cache.stash_mtime then
         f:close()
         return _cache.stash_count
     end
 
     if sz == 0 then
-        set_stash_cache(stashpath, sz, 0)
+        set_stash_cache(stashpath, sz, stash_mtime, 0)
         f:close()
         return 0
     end
@@ -369,22 +419,27 @@ local function getstashcount()
     f:seek('set', 0)
     local stash_content = f:read('*a')
     if not stash_content then
-        set_stash_cache(stashpath, sz, 0)
+        set_stash_cache(stashpath, sz, stash_mtime, 0)
         f:close()
         return 0
     end
-    local _, count = stash_content:gsub('\n', '\n')
-    set_stash_cache(stashpath, sz, count)
+    local _, count = stash_content:gsub('[^\r\n]+', '')
+    set_stash_cache(stashpath, sz, stash_mtime, count)
     f:close()
     
     return _cache.stash_count
 end
 
+local function set_stash_prompt(count)
+    count = count or 0
+    _cache.stash_prompt = count > 0
+        and (config.color.clean .. (config.status_format.stashed):format(count) .. config.color.reset)
+        or ''
+end
+
 local function refresh_stash_cache()
     local stash_count = getstashcount()
-    _cache.stash_prompt = stash_count > 0
-        and (config.color.clean .. (config.status_format.stashed):format(stash_count) .. config.color.reset)
-        or ''
+    set_stash_prompt(stash_count)
 end
 refresh_stash_cache()
 clink.onbeginedit(refresh_stash_cache)
@@ -408,14 +463,158 @@ clink.onbeginedit(refresh_stash_cache)
 -- getconflictstatus   76ms    getconflictstatus   81ms   !!!
 --     getsystemname   71µs        getsystemname   9µs
 --
+local function should_refresh_untracked()
+    local interval = config.untracked_refresh_interval
+    if interval == false then
+        return false
+    end
+    if not interval or interval <= 0 then
+        return true
+    end
+    return not _cache.git_untracked_at or (clock() - _cache.git_untracked_at) >= interval
+end
+
+local B_HASH  = 35
+local B_SPACE = 32
+local B_DOT   = 46
+local B_1     = 49
+local B_2     = 50
+local B_QMARK = 63
+local B_A     = 65
+local B_C     = 67
+local B_D     = 68
+local B_M     = 77
+local B_R     = 82
+local B_T     = 84
+local B_U     = 85
+local B_u     = 117
+
+local function has_status_change_byte(c)
+    return c and c ~= B_DOT and c ~= B_SPACE
+end
+
+local function parse_branch_ab(info, line)
+    local plus = line:find('+', 13, true)
+    if not plus then return end
+
+    local sep = line:find(' ', plus + 1, true)
+    if not sep then return end
+
+    local minus = line:find('-', sep + 1, true)
+    if minus then
+        info.ahead = to_int(line:sub(plus + 1, sep - 1))
+        info.behind = to_int(line:sub(minus + 1))
+    end
+end
+
+local function update_status_branch(info, oid)
+    if info.branch == '(detached)' and oid and oid ~= '(initial)' then
+        info.branch = oid:sub(1, 7)
+    end
+end
+
+local status_command_cache = {}
+local function get_status_command(scan_untracked)
+    local key = (scan_untracked and '1' or '0') .. (config.status_include_submodules and '1' or '0')
+    local cached = status_command_cache[key]
+    if cached then
+        return cached
+    end
+
+    local cmd = 'status --porcelain=v2 --branch'
+    cmd = cmd .. (scan_untracked and ' --untracked-files=normal' or ' --untracked-files=no')
+    if not config.status_include_submodules then
+        cmd = cmd .. ' --ignore-submodules=all'
+    end
+
+    cached = git.makecommand(cmd)
+    status_command_cache[key] = cached
+    return cached
+end
+
+local function read_status_porcelain(info, scan_untracked)
+    if not (git.makecommand and io.popenyield) then
+        return false
+    end
+
+    local full_cmd = get_status_command(scan_untracked)
+    if not full_cmd then
+        return false
+    end
+
+    local file, pclose = io.popenyield(full_cmd, 'rt')
+    if not file then
+        return false
+    end
+
+    local oid = nil
+    local conflicted, deleted, modified, renamed, staged, tracked, untracked = 0, 0, 0, 0, 0, 0, 0
+    while true do
+        local line = file:read('*line')
+        if not line then break end
+
+        local kind = line:byte(1)
+        if kind == B_HASH then
+            if line:sub(1, 14) == '# branch.head ' then
+                info.branch = line:sub(15)
+            elseif line:sub(1, 13) == '# branch.oid ' then
+                oid = line:sub(14)
+            elseif line:sub(1, 18) == '# branch.upstream ' then
+                info.upstream = line:sub(19)
+            elseif line:sub(1, 12) == '# branch.ab ' then
+                parse_branch_ab(info, line)
+            end
+        elseif kind == B_QMARK then
+            untracked = untracked + 1
+        elseif kind == B_1 or kind == B_2 or kind == B_u then
+            local x, y = line:byte(3), line:byte(4)
+            if kind == B_u or x == B_U or y == B_U or
+                (x == B_A and y == B_A) or (x == B_D and y == B_D) then
+                conflicted = conflicted + 1
+            elseif x == B_D or y == B_D then
+                deleted = deleted + 1
+            elseif y == B_M or y == B_T then
+                modified = modified + 1
+            elseif x == B_R or x == B_C then
+                renamed = renamed + 1
+            elseif has_status_change_byte(x) then
+                staged = staged + 1
+            elseif has_status_change_byte(y) then
+                tracked = tracked + 1
+            end
+        end
+    end
+
+    local ok = true
+    if pclose then
+        ok = pclose()
+    else
+        ok = file:close()
+    end
+    update_status_branch(info, oid)
+    info.conflicted = conflicted
+    info.deleted = deleted
+    info.modified = modified
+    info.renamed = renamed
+    info.staged = staged
+    info.tracked = tracked
+    info.untracked = untracked
+    return ok and true or false
+end
+
 local function collect_status()
-    if not git.isgitdir() then return nil end
+    local gd = (git.getgitdir and git.getgitdir()) or nil
+    if not gd then return nil end
 
     local info = {
+        git_dir      = gd,
+        branch       = nil,
+        upstream     = nil,
         ahead        = 0,
         behind       = 0,
         tracked      = 0,
         untracked    = 0,
+        untracked_refreshed = false,
         modified     = 0,
         staged       = 0,
         renamed      = 0,
@@ -425,43 +624,18 @@ local function collect_status()
         dirty_dir    = nil,
     }
     
-    -- arg1: ignore untracked, arg2: include submodules
-    local status = git.getstatus(false, false)
-    if not status then return nil end
-    
-    info.dirty_branch = status.dirty and true or false
-    
-    -- ahead/behind (numbers or nil)
-    info.ahead  = to_int(status.ahead)
-    info.behind = to_int(status.behind)
-    
-    -- file counts
-    info.conflicted = to_int(status.conflict)
-    info.tracked    = to_int(status.tracked)
-    info.untracked  = to_int(status.untracked)
+    local scan_untracked = should_refresh_untracked()
+    if not read_status_porcelain(info, scan_untracked) then
+        return nil
+    end
+
+    if not scan_untracked then
+        info.untracked = _cache.git_untracked_count
+    end
+    info.untracked_refreshed = scan_untracked
     info.dirty_dir  = info.untracked > 0 or false
-    
-    -- working tree modifications
-    if status.working then
-        info.modified = to_int(status.working.modify)
-        -- also exists status.working.untracked
-    end
-    
-    -- staged changes; sum add/modify/delete/rename (copy is folded into rename)
-    if status.staged then
-        local s = 0
-        s = s + to_int(status.staged.add)
-        s = s + to_int(status.staged.modify)
-        s = s + to_int(status.staged.delete)
-        s = s + to_int(status.staged.rename)
-        info.staged  = s
-        info.renamed = to_int(status.staged.rename)
-    end
-    
-    -- unique deletes across working+index
-    if status.total and status.total.delete then
-        info.deleted = to_int(status.total.delete)
-    end
+    info.dirty_branch = info.conflicted > 0 or info.modified > 0 or info.renamed > 0 or
+        info.deleted > 0 or info.staged > 0 or info.tracked > 0 or info.dirty_dir
     
     return info
 end
@@ -534,6 +708,10 @@ local function profile()
     if config.profile then response.duration = clock() end
     response.info = collect_status()
     if config.profile then response.duration = clock() - response.duration end
+    response.finished_at = clock()
+    if config.stash_git_fallback and not _cache.stash_path and git.getstashcount then
+        response.stash_count = to_int(git.getstashcount())
+    end
     
     return response
 end
@@ -579,12 +757,23 @@ local pf = clink.promptfilter(FILTER_PRIORITY)
 function pf:filter()
     local response = clink.promptcoroutine(profile)
     if response and response.info and response.cwd == _cache.cwd then
+        _cache.git_dir       = response.info.git_dir
+        _cache.git_branch    = response.info.branch
         _cache.dirty_branch = response.info.dirty_branch
         _cache.dirty_dir    = response.info.dirty_dir
         _cache.git_render   = git_render(response.info)
+        set_git_upstream_cache(response.info.upstream)
+        if response.info.untracked_refreshed then
+            _cache.git_untracked_at = response.finished_at or clock()
+            _cache.git_untracked_count = response.info.untracked
+        end
     end
     if config.profile and response and response.duration and response.cwd == _cache.cwd then
         _cache.git_duration = fmt_duration(response.duration)
+    end
+    if response and response.stash_count and response.cwd == _cache.cwd then
+        set_stash_cache(nil, nil, nil, response.stash_count)
+        set_stash_prompt(response.stash_count)
     end
     
     local dir_color = config.color.reset
