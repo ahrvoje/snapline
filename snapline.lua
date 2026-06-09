@@ -4,6 +4,7 @@
 -- Legend:  conflicted=' |N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?'
 --            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??'     stashed=' ≡N'  renamed=' »N'
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
+-- Exit code marker: red '✗N >' when the last command failed (negative codes shown as hex NTSTATUS)
 
 local clock  = os.clock      -- Clink clock returning seconds with us precision
 local concat = table.concat
@@ -34,7 +35,8 @@ local function get_init_cache()
         stash_mtime = nil,
         stash_count = 0,
         stash_prompt = '',
-        git_render = '',
+        git_render_text = nil,
+        git_status_at = nil,
         git_duration = '',
         dirty_branch = nil,
         dirty_dir = nil,
@@ -62,6 +64,7 @@ local config = {
     --     bytes([243, 177, 144, 139]).decode('utf-8')  >  '\U000f140b'
     
     branch_symbol = '\238\130\160',  -- UTF-8 code for branch glyph, UTF-16 is 'e0a0'
+    error_symbol = '✗',              -- prefix of the nonzero exit code marker in left prompt
     color = {
         -- https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
         -- '\x1b' is hex ASCII 27 for Esc, '[' is Control Sequence Introducer (CSI)
@@ -120,7 +123,34 @@ local config = {
     status_include_submodules = false,
     stash_git_fallback = false,
     profile = false,
+    -- Enter on a blank line can't change git state, so the last status is
+    -- reused without spawning git.  It is still refreshed when older than
+    -- this many seconds to catch changes made from other terminals.
+    -- Set 0 to always refresh.
+    blank_input_reuse_age = 10.0,
+    -- Render status glyphs dimmed while an async refresh is pending, so
+    -- stale info is visually distinct.  Color is restored when it lands.
+    dim_stale_status = true,
+    -- Show last exit code in the left prompt when nonzero, e.g. '✗1 >'.
+    -- Negative codes are shown as hex NTSTATUS, e.g. '✗0xC0000005 >'.
+    -- Requires Clink setting 'cmd.get_errorlevel' (on by default).
+    errorlevel_indicator = true,
+    -- When the upstream is '<remote>/<current branch>' show only '<remote>',
+    -- the full upstream name is shown only when it actually differs.
+    abbreviate_upstream = true,
+    -- Hide last-command durations below this many seconds.  Set 0 to show all.
+    min_duration_display = 0.,
+    -- Print a one-time hint when git status is repeatedly slow and
+    -- core.fsmonitor is not enabled for the repo.
+    fsmonitor_hint = true,
+    fsmonitor_hint_threshold = 0.080,  -- seconds; status slower than this is 'slow'
+    fsmonitor_hint_count = 5,          -- consecutive slow statuses before hinting
 }
+
+-- one-time fsmonitor hint state
+local slow_status_count = 0
+local fsmonitor_hint_done = false
+local pending_hint = nil
 
 -- append value to table only if it is not nil/empty
 local function append_non_empty(t, s)
@@ -152,7 +182,8 @@ local function clear_git_status_cache()
     _cache.git_upstream_prompt = ''
     _cache.git_untracked_at = nil
     _cache.git_untracked_count = 0
-    _cache.git_render = ''
+    _cache.git_render_text = nil
+    _cache.git_status_at = nil
     _cache.git_duration = ''
     _cache.dirty_branch = nil
     _cache.dirty_dir = nil
@@ -164,18 +195,27 @@ local function clear_git_identity_cache()
     clear_git_status_cache()
 end
 
-local function set_git_upstream_cache(upstream)
+local function set_git_upstream_cache(upstream, branch)
     upstream = trim(upstream)
     if not upstream then
         _cache.git_upstream_key = nil
         _cache.git_upstream_prompt = ''
         return
     end
-    if upstream == _cache.git_upstream_key then
+    local key = upstream .. '\0' .. (branch or '')
+    if key == _cache.git_upstream_key then
         return
     end
-    _cache.git_upstream_key = upstream
-    _cache.git_upstream_prompt = config.color.now .. upstream .. config.color.reset
+    local display = upstream
+    if config.abbreviate_upstream and branch then
+        -- 'origin/main' on branch 'main' is the common case: show just 'origin'
+        local suffix = '/' .. branch
+        if #upstream > #suffix and upstream:sub(-#suffix) == suffix then
+            display = upstream:sub(1, #upstream - #suffix)
+        end
+    end
+    _cache.git_upstream_key = key
+    _cache.git_upstream_prompt = config.color.now .. display .. config.color.reset
 end
 
 local function set_stash_cache(path, size, mtime, count)
@@ -208,17 +248,8 @@ local function normalize_env_name(s)
     return trim(inner or s)
 end
 
--- extract venv name from env vars
-local function venv_name()
-    return normalize_env_name(getenv('VIRTUAL_ENV_PROMPT'))
-        or basename_any_path(getenv('VIRTUAL_ENV'))
-        or normalize_env_name(getenv('CONDA_PROMPT_MODIFIER'))
-        or normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
-        or normalize_env_name(getenv('PYENV_VERSION'))
-end
-
 local function get_cwd()
-    return getenv('CD') or getenv('PWD') or ''
+    return os.getcwd() or ''
 end
 
 local PATH_SEP = (package and package.config and package.config:sub(1, 1)) or '\\'
@@ -282,34 +313,38 @@ local function get_cached_pyvenv_version(venv_root)
     return ver
 end
 
-local function refresh_python_capsule()
+-- venv name and python capsule from a single pass over the env vars
+local function refresh_python_env()
+    local virtual_env = getenv('VIRTUAL_ENV')
+    local conda_env   = normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
+    local pyenv       = normalize_env_name(getenv('PYENV_VERSION'))
+    local uv_active   = getenv('UV_ACTIVE')
+
+    _cache.venv = normalize_env_name(getenv('VIRTUAL_ENV_PROMPT'))
+        or basename_any_path(virtual_env)
+        or normalize_env_name(getenv('CONDA_PROMPT_MODIFIER'))
+        or conda_env
+        or pyenv
+
     local source = nil
     local version = extract_python_version(getenv('PYTHON_VERSION')) or extract_python_version(getenv('UV_PYTHON'))
-    
-    local venv_root = getenv('VIRTUAL_ENV')
-    if venv_root and #venv_root > 0 then
-        source = getenv('UV_ACTIVE') and 'uv' or 'venv'
-        version = get_cached_pyvenv_version(venv_root) or version
-    else
-        local conda_env = normalize_env_name(getenv('CONDA_DEFAULT_ENV'))
-        if conda_env then
-            source = 'conda'
-        else
-            local pyenv = normalize_env_name(getenv('PYENV_VERSION'))
-            if pyenv then
-                source = 'pyenv'
-                version = extract_python_version(pyenv) or version
-            elseif getenv('UV_ACTIVE') then
-                source = 'uv'
-            end
-        end
+    if virtual_env and #virtual_env > 0 then
+        source = uv_active and 'uv' or 'venv'
+        version = get_cached_pyvenv_version(virtual_env) or version
+    elseif conda_env then
+        source = 'conda'
+    elseif pyenv then
+        source = 'pyenv'
+        version = extract_python_version(pyenv) or version
+    elseif uv_active then
+        source = 'uv'
     end
-    
+
     if not source then
         _cache.python_prompt = ''
         return
     end
-    
+
     local capsule = 'py'
     if version then
         capsule = capsule .. version
@@ -330,7 +365,7 @@ local function refresh_git_identity_cache()
     end
     _cache.git_dir = gd
     if git.getbranch then
-        local branch = git.getbranch(gd, true)
+        local branch = git.getbranch()
         if branch and branch ~= '.invalid' then
             if _cache.git_branch and _cache.git_branch ~= branch then
                 clear_git_status_cache()
@@ -342,13 +377,17 @@ end
 
 -- refresh cache only on prompt boundaries, not every filter render
 local function refresh_runtime_cache()
+    if pending_hint then
+        clink.print(config.color.took .. pending_hint .. config.color.reset)
+        pending_hint = nil
+    end
     local cwd = get_cwd()
     if cwd ~= _cache.cwd then
         _cache = get_init_cache()
         _cache.cwd = cwd
+        slow_status_count = 0
     end
-    _cache.venv = venv_name()
-    refresh_python_capsule()
+    refresh_python_env()
     refresh_git_identity_cache()
 end
 refresh_runtime_cache()
@@ -521,6 +560,8 @@ local function get_status_command(scan_untracked)
         return cached
     end
 
+    -- git.makecommand already runs git with --no-optional-locks, so the async
+    -- status never takes index.lock and can't collide with typed git commands
     local cmd = 'status --porcelain=v2 --branch'
     cmd = cmd .. (scan_untracked and ' --untracked-files=normal' or ' --untracked-files=no')
     if not config.status_include_submodules then
@@ -547,12 +588,21 @@ local function read_status_porcelain(info, scan_untracked)
         return false
     end
 
+    -- single bulk read keeps Lua<->C crossings low even for huge outputs
+    local content = file:read('*a')
+    local ok
+    if pclose then
+        ok = pclose()
+    else
+        ok = file:close()
+    end
+    if not ok or not content then
+        return false
+    end
+
     local oid = nil
     local conflicted, deleted, modified, renamed, staged, tracked, untracked = 0, 0, 0, 0, 0, 0, 0
-    while true do
-        local line = file:read('*line')
-        if not line then break end
-
+    for line in content:gmatch('[^\r\n]+') do
         local kind = line:byte(1)
         if kind == B_HASH then
             if line:sub(1, 14) == '# branch.head ' then
@@ -585,12 +635,6 @@ local function read_status_porcelain(info, scan_untracked)
         end
     end
 
-    local ok = true
-    if pclose then
-        ok = pclose()
-    else
-        ok = file:close()
-    end
     update_status_branch(info, oid)
     info.conflicted = conflicted
     info.deleted = deleted
@@ -599,7 +643,7 @@ local function read_status_porcelain(info, scan_untracked)
     info.staged = staged
     info.tracked = tracked
     info.untracked = untracked
-    return ok and true or false
+    return true
 end
 
 local function collect_status()
@@ -658,38 +702,55 @@ local function git_render(info)
     if info.tracked > 0 then parts[#parts + 1] = (fmt.tracked):format(info.tracked) end
     if info.untracked > 0 then parts[#parts + 1] = (fmt.untracked):format(info.untracked) end
     
-    -- render must not be empty string or right prompt doesn't get redrawn after async!
-    -- so if git info is empty still return it wrapped in colors - don't simplify to ''
-    local color = info.dirty_branch and config.color.dirty or config.color.clean
-    return color .. concat(parts, ' ') .. config.color.reset
+    -- color is applied at render time in rightfilter so pending status can be dimmed
+    return concat(parts, ' ')
 end
 
 local function fmt_duration(s)
     -- clock precision 1e-6
     if not s or s < 1e-6 then return '' end
-    
-    if s < 1e-3 then return format('%.0fµs', s*1000000) end
-    if s < 1    then return format('%.0fms', s*1000) end
-    if s < 60   then return format('%.2fs', s) end
-    
-    local m = floor(s/60)
-    local r = floor(s - m*60 + 0.5)
+
+    -- round to the display unit first so rollover can't render '1000µs' or '1m60s'
+    if s < 1e-3 then
+        local us = floor(s*1000000 + 0.5)
+        if us < 1000 then return format('%dµs', us) end
+        s = us * 1e-6
+    end
+    if s < 1 then
+        local ms = floor(s*1000 + 0.5)
+        if ms < 1000 then return format('%dms', ms) end
+        s = ms * 1e-3
+    end
+    if s < 60 then
+        local sec = format('%.2f', s)
+        if sec ~= '60.00' then return sec .. 's' end
+        s = 60
+    end
+
+    local total = floor(s + 0.5)
+    local m, r = floor(total/60), total % 60
     if m < 60 then return format('%dm%ds', m, r) end
-    
-    local h, m = floor(m/60), m % 60
-    return format('%dh%dm%ds', h, m, r)
+
+    local h = floor(m/60)
+    return format('%dh%dm%ds', h, m % 60, r)
 end
 
 -- measure the duration of last run command
+-- blank input runs nothing: keep the previous duration on display and let
+-- profile() reuse the last git status since nothing could have changed
 local last_start, last_dur_s
+local last_input_blank = false
 clink.onbeginedit(function ()
     if last_start then
         last_dur_s = clock() - last_start
         last_start = nil
     end
 end)
-clink.onendedit(function ()
-    last_start = clock()
+clink.onendedit(function (line)
+    last_input_blank = not (line and line:find('%S'))
+    if not last_input_blank then
+        last_start = clock()
+    end
 end)
 
 local function dir_name()
@@ -701,18 +762,59 @@ local function dir_name()
     return cwd:match('^(%a:)') or cwd
 end
 
+-- read a git config value; runs inside the prompt coroutine, at most once per session
+local function git_config_value(name)
+    if not (git.makecommand and io.popenyield) then return nil end
+    local cmd = git.makecommand('config --get ' .. name)
+    if not cmd then return nil end
+    local f, pclose = io.popenyield(cmd, 'rt')
+    if not f then return nil end
+    local out = f:read('*a')
+    if pclose then pclose() else f:close() end
+    return trim(out)
+end
+
+local function check_fsmonitor_hint(duration)
+    if not config.fsmonitor_hint or fsmonitor_hint_done then return end
+    if duration < config.fsmonitor_hint_threshold then
+        slow_status_count = 0
+        return
+    end
+    slow_status_count = slow_status_count + 1
+    if slow_status_count < config.fsmonitor_hint_count then return end
+    fsmonitor_hint_done = true
+    if not git_config_value('core.fsmonitor') then
+        pending_hint = format(
+            'snapline: git status took >%.0fms %d times in a row - consider "git config core.fsmonitor true" and "git config core.untrackedCache true" for this repo',
+            config.fsmonitor_hint_threshold * 1000, config.fsmonitor_hint_count)
+    end
+end
+
 local function profile()
     local response = {}
     response.cwd = _cache.cwd
-    
-    if config.profile then response.duration = clock() end
+
+    -- blank input can't change git state: reuse the last status while fresh
+    if last_input_blank and _cache.git_status_at and
+        config.blank_input_reuse_age and config.blank_input_reuse_age > 0 and
+        (clock() - _cache.git_status_at) < config.blank_input_reuse_age then
+        response.reused = true
+        return response
+    end
+
+    -- duration is always measured since it drives the fsmonitor hint,
+    -- config.profile only controls displaying it in the prompt
+    response.duration = clock()
     response.info = collect_status()
-    if config.profile then response.duration = clock() - response.duration end
+    response.duration = clock() - response.duration
     response.finished_at = clock()
+    if response.info then
+        check_fsmonitor_hint(response.duration)
+    end
     if config.stash_git_fallback and not _cache.stash_path and git.getstashcount then
         response.stash_count = to_int(git.getstashcount())
     end
-    
+
     return response
 end
 
@@ -742,27 +844,48 @@ local function git_left_prompt()
 end
 
 local function fmt_last_cmd_duration()
+    if not last_dur_s or last_dur_s < config.min_duration_display then return '' end
+
     local d = fmt_duration(last_dur_s)
     if d == '' then return '' end
-    
+
     -- limit command time duration width to 5 characters
     if #d < 5 then d = format('%5s', d) end
-    
-    return config.color.took .. d .. config.color.clean
+
+    return config.color.took .. d .. config.color.reset
+end
+
+-- '> ' marker carrying the last exit code when nonzero, e.g. '✗1 > '
+-- requires Clink setting 'cmd.get_errorlevel' (on by default)
+local function errorlevel_prompt_char()
+    if config.errorlevel_indicator then
+        local code = os.geterrorlevel and os.geterrorlevel() or to_int(getenv('ERRORLEVEL'))
+        if code ~= 0 then
+            -- negative codes are NTSTATUS values, e.g. 0xC0000005 access violation
+            local shown = code < 0 and format('0x%08X', code + 4294967296) or code
+            return config.color.dirty .. config.error_symbol .. shown .. config.color.reset .. ' > '
+        end
+    end
+    return '> '
 end
 
 local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
+-- true while the async status refresh is still pending for this prompt
+local git_status_stale = false
 -- left prompt, first in execution line so it contains async promptcoroutine
 function pf:filter()
     local response = clink.promptcoroutine(profile)
+    -- blank input can't invalidate the cached status, so it is never stale then
+    git_status_stale = response == nil and not last_input_blank
     if response and response.info and response.cwd == _cache.cwd then
         _cache.git_dir       = response.info.git_dir
         _cache.git_branch    = response.info.branch
         _cache.dirty_branch = response.info.dirty_branch
         _cache.dirty_dir    = response.info.dirty_dir
-        _cache.git_render   = git_render(response.info)
-        set_git_upstream_cache(response.info.upstream)
+        _cache.git_render_text = git_render(response.info)
+        _cache.git_status_at = response.finished_at or clock()
+        set_git_upstream_cache(response.info.upstream, response.info.branch)
         if response.info.untracked_refreshed then
             _cache.git_untracked_at = response.finished_at or clock()
             _cache.git_untracked_count = response.info.untracked
@@ -786,18 +909,31 @@ function pf:filter()
     append_non_empty(prompt_parts, (venv and #venv > 0) and (config.color.venv .. '{' .. venv .. '}') or nil)
     append_non_empty(prompt_parts, git_left_prompt())
     append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
-    append_non_empty(prompt_parts, '> ')
+    append_non_empty(prompt_parts, errorlevel_prompt_char())
     return concat(prompt_parts, ' ')
 end
 -- right filter, second in execution line so it doesn't contain async calls
 -- it uses cached values provided by the left prompt after its async call
 function pf:rightfilter()
+    -- in a repo the status render must not be an empty string or the right
+    -- prompt doesn't get redrawn after async! - with no glyphs still emit colors
+    local git_status_prompt = nil
+    if _cache.git_render_text then
+        local color = config.color.clean
+        if config.dim_stale_status and git_status_stale then
+            color = config.color.took
+        elseif _cache.dirty_branch then
+            color = config.color.dirty
+        end
+        git_status_prompt = color .. _cache.git_render_text .. config.color.reset
+    end
+
     local stash_prompt = _cache.stash_prompt or ''
     local right_prompt_time = config.color.now .. date('%H:%M:%S') .. config.color.reset
 
     local prompt_parts = {}
     append_non_empty(prompt_parts, _cache.git_duration)
-    append_non_empty(prompt_parts, _cache.git_render)
+    append_non_empty(prompt_parts, git_status_prompt)
     append_non_empty(prompt_parts, _cache.git_upstream_prompt)
     append_non_empty(prompt_parts, stash_prompt)
     append_non_empty(prompt_parts, _cache.python_prompt)

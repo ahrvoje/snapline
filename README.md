@@ -7,6 +7,9 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Async all delays so editing is never blocked.
   * Cache last results so the content is always & instantly present.
   * Implement alternative methods proven to run much faster.
+  * Blank Enter reuses the last git status - no git process is spawned at all.
+  * Async status runs with ```--no-optional-locks``` so it never takes ```index.lock``` and never collides with git commands typed at the prompt.
+  * One-time hint to enable ```core.fsmonitor``` when git status is repeatedly slow.
   * Benchmark of Clink methods, and alternative implementations; red are only called async
     <img src="resources/clink_benchmark.png" width="640" style="margin-left: 50px">
 ## Info
@@ -18,9 +21,11 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
     * no-repo in white
     * clean in green
     * dirty in red (untracked files found)
+  * last exit code in red when nonzero, e.g. ```✗1 >``` (negative codes shown as hex NTSTATUS, e.g. ```✗0xC0000005 >```)
 ### Right prompt
-  * git status glyphs
-  * duration of the last executed command
+  * git status glyphs (dimmed while an async refresh is still pending)
+  * git upstream, abbreviated to the remote name when it matches the current branch
+  * duration of the last executed command (shown when ≥ 100ms, configurable)
   * current time
 ## git
   * branch
