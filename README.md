@@ -61,9 +61,6 @@ Past prompts can collapse to just the exit marker (```> ``` or ```✗1 > ```) wi
 
     clink set prompt.transient always
 
-## Terminal shell integration
-
-Set ```shell_integration = true``` in the config table to emit OSC 133 A/B/C/D command marks and the OSC 9;9 working directory. Terminals with shell integration (Windows Terminal, WezTerm, ...) can then jump between prompts, select a command's output, mark failed commands in the scrollbar, and duplicate tabs in the same directory. Escape-codes only, no measurable cost.
 
 ## Configuration
 

@@ -167,12 +167,6 @@ local config = {
     fetch_age_min = 259200,  -- 3 days
     -- Hide last-command durations below this many seconds.  Set 0 to show all.
     min_duration_display = 0.,
-    -- Emit OSC 133 A/B/C/D command marks and OSC 9;9 working directory so
-    -- terminals with shell integration (Windows Terminal, WezTerm, ...) can
-    -- jump between prompts, select command output, mark failed commands in
-    -- the scrollbar and duplicate tabs in the same cwd.  Escape-codes only,
-    -- no measurable cost.
-    shell_integration = false,
     -- Print a one-time hint when git status is repeatedly slow and
     -- core.fsmonitor is not enabled for the repo.
     fsmonitor_hint = true,
@@ -881,8 +875,6 @@ local last_input_neutral = false
 -- bumped whenever an input line may have changed git state; an async status
 -- collection is applied only when the count it started with is still current
 local mutation_count = 0
--- set on Enter of a non-blank line, drives the OSC 133;D exit code mark
-local command_ran = false
 
 -- commands that can't change git state as long as no redirection is involved
 local NEUTRAL_CMDS = {
@@ -1205,24 +1197,6 @@ local function errorlevel_prompt_char()
     return '> '
 end
 
--- shell integration marks: https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration
--- A = prompt start, B = input start, C = command output start, D = command
--- done + exit code; OSC 9;9 reports cwd for duplicate-tab-in-same-directory
-local function shell_integration_beginedit()
-    if not config.shell_integration then
-        command_ran = false
-        return
-    end
-    local out = {}
-    if command_ran then
-        command_ran = false
-        local code = (os.geterrorlevel and os.geterrorlevel()) or 0
-        out[#out + 1] = format('\x1b]133;D;%d\x1b\\', code)
-    end
-    out[#out + 1] = '\x1b]9;9;' .. get_cwd() .. '\x1b\\'
-    clink.print(concat(out), NONL)
-end
-
 local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
 -- true while an async status refresh is still pending for the shown status
@@ -1297,14 +1271,7 @@ function pf:surround()
     -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
 
     -- prefix, suffix, rprefix, rsuffix
-    local prefix = '\x1b[2K'
-    local suffix = ''
-    if config.shell_integration then
-        -- re-marking A/B on every redraw is fine: marks apply to the redrawn spot
-        prefix = '\x1b]133;A\x1b\\' .. prefix
-        suffix = '\x1b]133;B\x1b\\'
-    end
-    return prefix, suffix, '', ''
+    return '\x1b[2K', '', '', ''
 end
 -- transient prompt (opt-in via 'clink set prompt.transient always'): past
 -- prompts collapse to just the exit marker, keeping scrollback compact
@@ -1379,12 +1346,6 @@ local function on_endedit(line)
         mutation_count = mutation_count + 1
     end
     last_start = clock()
-    if not last_input_blank then
-        command_ran = true
-        if config.shell_integration then
-            clink.print('\x1b]133;C\x1b\\', NONL)
-        end
-    end
 end
 
 refresh_runtime_cache()
@@ -1392,7 +1353,6 @@ refresh_stash_cache()
 refresh_fetch_age()
 
 clink.onbeginedit(on_beginedit_timing)
-clink.onbeginedit(shell_integration_beginedit)
 clink.onbeginedit(refresh_runtime_cache)
 clink.onbeginedit(refresh_stash_cache)
 clink.onbeginedit(refresh_fetch_age)

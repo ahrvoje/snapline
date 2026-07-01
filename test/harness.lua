@@ -388,21 +388,10 @@ check(bench_out:find('snapline bench', 1, true) ~= nil, 'bench printed results')
 check(bench_out:find('collect_status', 1, true) ~= nil, 'bench included snapline alternatives')
 
 -- =====================================================================
-print('===== suite 2: shell integration + no-ahead-behind =====')
-load_snapline({ shell_integration = true, ahead_behind = false })
-local pre, suf = H.pf:surround()
-check(pre:find(']133;A', 1, true) ~= nil and pre:find('\27[2K', 1, true) ~= nil,
-    'surround prefix has OSC 133;A and clear-line')
-check(suf:find(']133;B', 1, true) ~= nil, 'surround suffix has OSC 133;B')
-H.printed = {}
-endedit('dir')
-check(table.concat(H.printed, '|'):find(']133;C', 1, true) ~= nil, 'OSC 133;C emitted on Enter')
-P.errorlevel = 3
-H.printed = {}
-beginedit()
-local joined = table.concat(H.printed, '|')
-check(joined:find(']133;D;3', 1, true) ~= nil, 'OSC 133;D carries exit code')
-check(joined:find(']9;9;', 1, true) ~= nil, 'OSC 9;9 cwd emitted')
+print('===== suite 2: transient prompt + no-ahead-behind =====')
+load_snapline({ ahead_behind = false })
+local pre = H.pf:surround()
+check(pre:find('\27[2K', 1, true) ~= nil, 'surround prefix has clear-line')
 
 -- transient prompt
 P.errorlevel = 0
