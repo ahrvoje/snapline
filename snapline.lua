@@ -3,8 +3,11 @@
 
 -- Legend:  conflicted=' |N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?'
 --            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??'     stashed=' ≡N'  renamed=' »N'
+--          '⇡?' upstream set but ahead/behind unknown (upstream gone or ahead_behind=false)
+--          '…' first status for this repo is still collecting     '~Nd' time since last fetch
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 -- Exit code marker: red '✗N >' when the last command failed (negative codes shown as hex NTSTATUS)
+-- Type 'snapline-bench' at the prompt to benchmark Clink git API calls vs snapline alternatives.
 
 local clock  = os.clock      -- Clink clock returning seconds with us precision
 local concat = table.concat
@@ -28,15 +31,16 @@ local function get_init_cache()
         git_untracked_count = 0,
         python_prompt = '',
         pyvenv_cfg_path = nil,
-        pyvenv_cfg_size = nil,
         pyvenv_version = nil,
         stash_path = nil,
         stash_size = nil,
         stash_mtime = nil,
         stash_count = 0,
         stash_prompt = '',
+        fetch_age_prompt = '',
         git_render_text = nil,
         git_status_at = nil,
+        git_status_failed = false,
         git_duration = '',
         dirty_branch = nil,
         dirty_dir = nil,
@@ -45,7 +49,7 @@ end
 local _cache = get_init_cache()
 
 -- No-op outside Clink prompt runtime.
-if not (clink and git and clink.promptfilter and clink.promptcoroutine and clink.onbeginedit and clink.onendedit) then
+if not (clink and git and clink.promptfilter and clink.refilterprompt and clink.onbeginedit and clink.onendedit) then
     return
 end
 
@@ -62,7 +66,7 @@ local config = {
     -- For non-BMP glyphs contaning more than 4 unicode digits
     --     list('\U000f140b'.encode('utf-8'))           >  [243, 177, 144, 139]
     --     bytes([243, 177, 144, 139]).decode('utf-8')  >  '\U000f140b'
-    
+
     branch_symbol = '\238\130\160',  -- UTF-8 code for branch glyph, UTF-16 is 'e0a0'
     error_symbol = '✗',              -- prefix of the nonzero exit code marker in left prompt
     color = {
@@ -89,6 +93,9 @@ local config = {
         diverged   = '⇕',    -- if ahead and behind at the same time
         ahead      = '⇡%d',
         behind     = '⇣%d',
+        ab_unknown = '⇡?',   -- upstream configured but counts unknown (gone or ahead_behind=false)
+        pending    = '…',    -- shown while the first status for a repo is still collecting
+        fetch_age  = '~%s',  -- time since last fetch, e.g. '~3d'
         conflicted = '\243\177\144\139%d',  -- UTF-8 code for thunder glyph, UTF-16 is 'f140b'
         staged     = '+%d',
         modified   = '!%d',
@@ -121,13 +128,29 @@ local config = {
     -- scan untracked files every time, or false to disable untracked counts.
     untracked_refresh_interval = 2.0,
     status_include_submodules = false,
+    -- Ahead/behind counts require walking commit history; on long-diverged
+    -- branches in big repos this can dominate status time.  Set false to add
+    -- --no-ahead-behind: status shows '⇡?' when the branch differs from its
+    -- upstream instead of exact counts.
+    ahead_behind = true,
     stash_git_fallback = false,
     profile = false,
-    -- Enter on a blank line can't change git state, so the last status is
-    -- reused without spawning git.  It is still refreshed when older than
+    -- Enter on input that provably can't change git state reuses the last
+    -- status without spawning git: a blank line always qualifies, and with
+    -- reuse_neutral_commands also read-only commands (cls, dir, git log, ...)
+    -- with no redirection.  The status is still refreshed when older than
     -- this many seconds to catch changes made from other terminals.
     -- Set 0 to always refresh.
     blank_input_reuse_age = 10.0,
+    reuse_neutral_commands = true,
+    -- While idle at the prompt, watch a handful of .git files (HEAD, index,
+    -- packed-refs, stash log, FETCH_HEAD, ...) and refresh the status when
+    -- they change, so commits made from other terminals or editors show up
+    -- without pressing Enter.  A probe costs microseconds; git runs only on
+    -- change.  Clink throttles long-lived coroutines to one resume per 5s,
+    -- so the effective cadence is watch_interval at first, later up to 5s.
+    watch_repo = true,
+    watch_interval = 2.0,
     -- Render status glyphs dimmed while an async refresh is pending, so
     -- stale info is visually distinct.  Color is restored when it lands.
     dim_stale_status = true,
@@ -138,8 +161,18 @@ local config = {
     -- When the upstream is '<remote>/<current branch>' show only '<remote>',
     -- the full upstream name is shown only when it actually differs.
     abbreviate_upstream = true,
+    -- Show a dim '~<age>' after the upstream when FETCH_HEAD is older than
+    -- this many seconds - a reminder that ahead/behind counts may be
+    -- outdated.  Set false to disable.
+    fetch_age_min = 259200,  -- 3 days
     -- Hide last-command durations below this many seconds.  Set 0 to show all.
     min_duration_display = 0.,
+    -- Emit OSC 133 A/B/C/D command marks and OSC 9;9 working directory so
+    -- terminals with shell integration (Windows Terminal, WezTerm, ...) can
+    -- jump between prompts, select command output, mark failed commands in
+    -- the scrollbar and duplicate tabs in the same cwd.  Escape-codes only,
+    -- no measurable cost.
+    shell_integration = false,
     -- Print a one-time hint when git status is repeatedly slow and
     -- core.fsmonitor is not enabled for the repo.
     fsmonitor_hint = true,
@@ -147,10 +180,27 @@ local config = {
     fsmonitor_hint_count = 5,          -- consecutive slow statuses before hinting
 }
 
+-- optional config overrides from a wrapper script (or test harness) that
+-- defines the global 'snapline_config' table before this file loads
+do
+    local overrides = rawget(_G, 'snapline_config')
+    if type(overrides) == 'table' then
+        for k, v in pairs(overrides) do
+            config[k] = v
+        end
+    end
+end
+
 -- one-time fsmonitor hint state
 local slow_status_count = 0
 local fsmonitor_hint_done = false
 local pending_hint = nil
+
+-- repo watcher is recreated for every input line session
+local watcher_started = false
+-- the prompt filter decides once per input line session whether to refresh;
+-- refilters after an async apply must not start another round
+local session_refresh_started = false
 
 -- append value to table only if it is not nil/empty
 local function append_non_empty(t, s)
@@ -171,9 +221,17 @@ local function to_int(v)
     return tonumber(v) or 0
 end
 
-local function set_pyvenv_cache(path, size, version)
+-- yield to the coroutine scheduler, but only when actually inside a coroutine
+-- (snapline-bench runs the same code paths on the main thread)
+local function maybe_yield()
+    local _, is_main = coroutine.running()
+    if not is_main then
+        coroutine.yield()
+    end
+end
+
+local function set_pyvenv_cache(path, version)
     _cache.pyvenv_cfg_path = path
-    _cache.pyvenv_cfg_size = size
     _cache.pyvenv_version = version
 end
 
@@ -184,6 +242,7 @@ local function clear_git_status_cache()
     _cache.git_untracked_count = 0
     _cache.git_render_text = nil
     _cache.git_status_at = nil
+    _cache.git_status_failed = false
     _cache.git_duration = ''
     _cache.dirty_branch = nil
     _cache.dirty_dir = nil
@@ -274,32 +333,27 @@ end
 
 local function get_cached_pyvenv_version(venv_root)
     if not venv_root or #venv_root == 0 then
-        set_pyvenv_cache(nil, nil, nil)
+        set_pyvenv_cache(nil, nil)
         return nil
     end
-    
+
+    -- read pyvenv.cfg only when VIRTUAL_ENV points somewhere new: activation
+    -- always changes the path, and file probes on every prompt would block
+    -- the prompt when the venv lives on a slow network share.  An in-place
+    -- rebuild of the same venv is rare and self-heals on reactivation.
     local cfg_path = join_path(venv_root, 'pyvenv.cfg')
-    local f = io.open(cfg_path, 'rb')
-    if not f then
-        set_pyvenv_cache(cfg_path, nil, nil)
-        return nil
-    end
-    
-    local sz = f:seek('end')
-    if sz and cfg_path == _cache.pyvenv_cfg_path and sz == _cache.pyvenv_cfg_size then
-        f:close()
+    if cfg_path == _cache.pyvenv_cfg_path then
         return _cache.pyvenv_version
     end
-    if not sz then
-        f:close()
-        set_pyvenv_cache(cfg_path, nil, nil)
+
+    local f = io.open(cfg_path, 'rb')
+    if not f then
+        set_pyvenv_cache(cfg_path, nil)
         return nil
     end
-    
-    f:seek('set', 0)
     local content = f:read('*a')
     f:close()
-    
+
     local ver = nil
     if content then
         local raw = content:match('^%s*version%s*=%s*([^\r\n]+)') or
@@ -308,8 +362,8 @@ local function get_cached_pyvenv_version(venv_root)
             content:match('[\r\n]%s*version_info%s*=%s*([^\r\n]+)')
         ver = extract_python_version(raw)
     end
-    
-    set_pyvenv_cache(cfg_path, sz, ver)
+
+    set_pyvenv_cache(cfg_path, ver)
     return ver
 end
 
@@ -359,7 +413,7 @@ local function refresh_git_identity_cache()
         clear_git_identity_cache()
         return
     end
-    
+
     if _cache.git_dir and _cache.git_dir ~= gd then
         clear_git_status_cache()
     end
@@ -375,54 +429,50 @@ local function refresh_git_identity_cache()
     end
 end
 
--- refresh cache only on prompt boundaries, not every filter render
-local function refresh_runtime_cache()
-    if pending_hint then
-        clink.print(config.color.took .. pending_hint .. config.color.reset)
-        pending_hint = nil
-    end
-    local cwd = get_cwd()
-    if cwd ~= _cache.cwd then
-        _cache = get_init_cache()
-        _cache.cwd = cwd
-        slow_status_count = 0
-    end
-    refresh_python_env()
-    refresh_git_identity_cache()
-end
-refresh_runtime_cache()
-clink.onbeginedit(refresh_runtime_cache)
-
-local function get_file_mtime(p)
+local function get_file_info(p)
     if not (p and os.findfiles) then
         return nil
     end
 
-    local ff = os.findfiles(p, 2, { files = true, dirs = false, hidden = true, system = true, dirsuffix = false })
+    local ff = os.findfiles(p, 2, { files = true, dirs = true, hidden = true, system = true, dirsuffix = false })
     if not ff then
         return nil
     end
 
     local item = ff:next()
     ff:close()
+    return item
+end
+
+local function get_file_mtime(p)
+    local item = get_file_info(p)
     return item and item.mtime or nil
+end
+
+-- 'size:mtime' identity stamp used to detect file changes, nil when absent
+local function get_file_stamp(p)
+    local item = get_file_info(p)
+    if not item then
+        return nil
+    end
+    return (item.size or 0) .. ':' .. (item.mtime or 0)
 end
 
 local function openstashlog()
     local gd = (git.getcommondir and git.getcommondir()) or git.getgitdir()
     if not gd then return nil, nil, nil, nil end
-    
+
     local stashpath = join_path(join_path(join_path(gd, 'logs'), 'refs'), 'stash')
     local f = io.open(stashpath, 'rb')
     if not f then return nil, nil, nil, nil end
-    
+
     -- seek is fast and lets us skip reading when size is unchanged
     local sz = f:seek('end')
     if not sz then
         f:close()
         return nil, nil, nil, nil
     end
-    
+
     return f, sz, stashpath, get_file_mtime(stashpath)
 end
 
@@ -438,10 +488,15 @@ end
 local function getstashcount()
     local f, sz, stashpath, stash_mtime = openstashlog()
     if not f or not sz or not stashpath then
+        -- without a readable stash reflog the async git fallback owns the
+        -- count; keep it instead of blinking it off on every prompt
+        if config.stash_git_fallback and not _cache.stash_path then
+            return _cache.stash_count
+        end
         set_stash_cache(nil, nil, nil, 0)
         return 0
     end
-    
+
     -- return cached stash count if cache is of the same path and file metadata
     if _cache.stash_size and stashpath == _cache.stash_path and
         sz == _cache.stash_size and stash_mtime == _cache.stash_mtime then
@@ -465,7 +520,7 @@ local function getstashcount()
     local _, count = stash_content:gsub('[^\r\n]+', '')
     set_stash_cache(stashpath, sz, stash_mtime, count)
     f:close()
-    
+
     return _cache.stash_count
 end
 
@@ -480,13 +535,72 @@ local function refresh_stash_cache()
     local stash_count = getstashcount()
     set_stash_prompt(stash_count)
 end
-refresh_stash_cache()
-clink.onbeginedit(refresh_stash_cache)
 
--- git status table using Clink's git API
--- potentialy slow function in the focus of the entire story!
+-- dim '~3d' reminder that ahead/behind may be outdated when the last fetch
+-- (FETCH_HEAD mtime) is older than config.fetch_age_min
+local function refresh_fetch_age()
+    _cache.fetch_age_prompt = ''
+    local min_age = config.fetch_age_min
+    if not min_age or min_age <= 0 or not _cache.git_dir then
+        return
+    end
+    local common = (git.getcommondir and git.getcommondir()) or _cache.git_dir
+    local mtime = get_file_mtime(join_path(common, 'FETCH_HEAD'))
+    if not mtime then
+        return
+    end
+    local age = os.time() - mtime
+    if age < min_age then
+        return
+    end
+    local text = age >= 86400 and format('%dd', floor(age / 86400)) or format('%dh', floor(age / 3600))
+    _cache.fetch_age_prompt = config.color.took ..
+        (config.status_format.fetch_age):format(text) .. config.color.reset
+end
+
+-- refresh cache only on prompt boundaries, not every filter render
+local function refresh_runtime_cache()
+    if pending_hint then
+        clink.print(config.color.took .. pending_hint .. config.color.reset)
+        pending_hint = nil
+    end
+    watcher_started = false
+    session_refresh_started = false
+    local cwd = get_cwd()
+    if cwd ~= _cache.cwd then
+        local old = _cache
+        _cache = get_init_cache()
+        _cache.cwd = cwd
+        slow_status_count = 0
+        -- python env caches are keyed by path, not cwd: carry them over
+        _cache.pyvenv_cfg_path = old.pyvenv_cfg_path
+        _cache.pyvenv_version = old.pyvenv_version
+        -- git status is repo-wide (repo-root relative), so it stays valid
+        -- across cd within the same repo: carry it instead of blanking the
+        -- glyphs until the async refresh lands
+        local gd = (git.getgitdir and git.getgitdir()) or nil
+        if gd and gd == old.git_dir then
+            _cache.git_dir = gd
+            _cache.git_branch = old.git_branch
+            _cache.git_upstream_key = old.git_upstream_key
+            _cache.git_upstream_prompt = old.git_upstream_prompt
+            _cache.git_untracked_at = old.git_untracked_at
+            _cache.git_untracked_count = old.git_untracked_count
+            _cache.git_render_text = old.git_render_text
+            _cache.git_status_at = old.git_status_at
+            _cache.git_duration = old.git_duration
+            _cache.dirty_branch = old.dirty_branch
+            _cache.dirty_dir = old.dirty_dir
+        end
+    end
+    refresh_python_env()
+    refresh_git_identity_cache()
+end
+
+-- git status via a single porcelain=v2 run
+-- potentialy slow subprocess in the focus of the entire story!
 --
--- typical benchmark times for a single call
+-- typical benchmark times for a single call ('snapline-bench' to re-measure)
 --         no-repo dir                 repo dir
 --
 --         getaction   71µs            getaction   53µs
@@ -540,10 +654,16 @@ local function parse_branch_ab(info, line)
     if not sep then return end
 
     local minus = line:find('-', sep + 1, true)
-    if minus then
-        info.ahead = to_int(line:sub(plus + 1, sep - 1))
-        info.behind = to_int(line:sub(minus + 1))
+    if not minus then return end
+
+    local ahead, behind = line:sub(plus + 1, sep - 1), line:sub(minus + 1)
+    if ahead == '?' or behind == '?' then
+        -- --no-ahead-behind prints '+? -?' when the branch differs from upstream
+        return
     end
+    info.has_ab = true
+    info.ahead = to_int(ahead)
+    info.behind = to_int(behind)
 end
 
 local function update_status_branch(info, oid)
@@ -554,7 +674,9 @@ end
 
 local status_command_cache = {}
 local function get_status_command(scan_untracked)
-    local key = (scan_untracked and '1' or '0') .. (config.status_include_submodules and '1' or '0')
+    local key = (scan_untracked and '1' or '0') ..
+        (config.status_include_submodules and '1' or '0') ..
+        (config.ahead_behind and '1' or '0')
     local cached = status_command_cache[key]
     if cached then
         return cached
@@ -566,6 +688,9 @@ local function get_status_command(scan_untracked)
     cmd = cmd .. (scan_untracked and ' --untracked-files=normal' or ' --untracked-files=no')
     if not config.status_include_submodules then
         cmd = cmd .. ' --ignore-submodules=all'
+    end
+    if not config.ahead_behind then
+        cmd = cmd .. ' --no-ahead-behind'
     end
 
     cached = git.makecommand(cmd)
@@ -601,8 +726,15 @@ local function read_status_porcelain(info, scan_untracked)
     end
 
     local oid = nil
+    local lines = 0
     local conflicted, deleted, modified, renamed, staged, tracked, untracked = 0, 0, 0, 0, 0, 0, 0
     for line in content:gmatch('[^\r\n]+') do
+        -- coroutines resume on the input thread: yield periodically so a huge
+        -- status output can't stall keystrokes while it is parsed
+        lines = lines + 1
+        if lines % 5000 == 0 then
+            maybe_yield()
+        end
         local kind = line:byte(1)
         if kind == B_HASH then
             if line:sub(1, 14) == '# branch.head ' then
@@ -654,6 +786,7 @@ local function collect_status()
         git_dir      = gd,
         branch       = nil,
         upstream     = nil,
+        has_ab       = false,
         ahead        = 0,
         behind       = 0,
         tracked      = 0,
@@ -667,7 +800,7 @@ local function collect_status()
         dirty_branch = nil,
         dirty_dir    = nil,
     }
-    
+
     local scan_untracked = should_refresh_untracked()
     if not read_status_porcelain(info, scan_untracked) then
         return nil
@@ -680,7 +813,7 @@ local function collect_status()
     info.dirty_dir  = info.untracked > 0 or false
     info.dirty_branch = info.conflicted > 0 or info.modified > 0 or info.renamed > 0 or
         info.deleted > 0 or info.staged > 0 or info.tracked > 0 or info.dirty_dir
-    
+
     return info
 end
 
@@ -689,7 +822,10 @@ local function git_render(info)
     local fmt = config.status_format
 
     local parts = {}
-    if info.ahead > 0 or info.behind > 0 then
+    if info.upstream and not info.has_ab then
+        -- upstream configured but counts unknown: gone upstream or ahead_behind=false
+        parts[#parts + 1] = fmt.ab_unknown
+    elseif info.ahead > 0 or info.behind > 0 then
         parts[#parts + 1] = (info.ahead > 0 and info.behind > 0 and fmt.diverged or '') ..
             (info.ahead > 0 and (fmt.ahead):format(info.ahead) or '') ..
             (info.behind > 0 and (fmt.behind):format(info.behind) or '')
@@ -701,7 +837,7 @@ local function git_render(info)
     if info.staged > 0 then parts[#parts + 1] = (fmt.staged):format(info.staged) end
     if info.tracked > 0 then parts[#parts + 1] = (fmt.tracked):format(info.tracked) end
     if info.untracked > 0 then parts[#parts + 1] = (fmt.untracked):format(info.untracked) end
-    
+
     -- color is applied at render time in rightfilter so pending status can be dimmed
     return concat(parts, ' ')
 end
@@ -736,33 +872,109 @@ local function fmt_duration(s)
 end
 
 -- measure the duration of last run command
--- blank input runs nothing: keep the previous duration on display and let
--- profile() reuse the last git status since nothing could have changed
+-- blank input is measured too: it shows the real Enter-to-prompt roundtrip
+-- (including cmd's hidden errorlevel capture), never a stale reading
 local last_start, last_dur_s
 local last_input_blank = false
-clink.onbeginedit(function ()
-    if last_start then
-        last_dur_s = clock() - last_start
-        last_start = nil
+-- true when the last input provably couldn't change git state
+local last_input_neutral = false
+-- bumped whenever an input line may have changed git state; an async status
+-- collection is applied only when the count it started with is still current
+local mutation_count = 0
+-- set on Enter of a non-blank line, drives the OSC 133;D exit code mark
+local command_ran = false
+
+-- commands that can't change git state as long as no redirection is involved
+local NEUTRAL_CMDS = {
+    cls = true, dir = true, type = true, echo = true, where = true,
+    ver = true, vol = true, help = true, whoami = true, hostname = true,
+    title = true, rem = true, cd = true, chdir = true, pushd = true,
+    popd = true, more = true, tree = true, find = true, findstr = true,
+    ['snapline-bench'] = true,
+}
+-- read-only git subcommands; fetch/pull/push are excluded on purpose since
+-- they move ahead/behind, and branch/tag/remote/config since they can mutate
+local NEUTRAL_GIT_SUBS = {
+    log = true, diff = true, show = true, blame = true, shortlog = true,
+    describe = true, status = true, reflog = true, grep = true, help = true,
+    version = true, ['ls-files'] = true, ['ls-tree'] = true,
+    ['ls-remote'] = true, ['rev-parse'] = true, ['rev-list'] = true,
+    ['cat-file'] = true, ['count-objects'] = true,
+}
+
+local function is_status_neutral_input(line)
+    if not config.reuse_neutral_commands then
+        return false
     end
-end)
-clink.onendedit(function (line)
-    last_input_blank = not (line and line:find('%S'))
-    if not last_input_blank then
-        last_start = clock()
+    -- redirection creates files, & ^ | chain or escape into arbitrary
+    -- commands, % expands env vars into anything, quotes and newlines make
+    -- parsing ambiguous: bail out on all of them, a refresh is never wrong
+    if line:find('[<>|&^%%"\r\n]') then
+        return false
     end
-end)
+    local first, rest = line:match('^%s*(%S+)%s*(.-)%s*$')
+    if not first or not first:match('^[%w%.%-_]+$') then
+        return false
+    end
+    first = first:lower()
+    -- doskey aliases can remap any name to an arbitrary command line
+    if os.getaliases then
+        local aliases = os.getaliases()
+        if aliases then
+            for i = 1, #aliases do
+                if aliases[i]:lower() == first then
+                    return false
+                end
+            end
+        end
+    end
+    if NEUTRAL_CMDS[first] then
+        return true
+    end
+    if first == 'git' or first == 'git.exe' then
+        -- --output-* diff/log flags write files without any shell redirection
+        if rest:find('--output', 1, true) then
+            return false
+        end
+        local sub, subrest = rest:match('^(%S+)%s*(.-)%s*$')
+        if not sub then
+            return false
+        end
+        sub = sub:lower()
+        if NEUTRAL_GIT_SUBS[sub] then
+            return true
+        end
+        if sub == 'stash' then
+            local op = subrest:match('^(%S+)')
+            return op == 'list' or op == 'show'
+        end
+    end
+    return false
+end
+
+-- the cached status can be reused without spawning git when the last input
+-- couldn't change git state and the cache is fresh enough
+local function git_status_is_fresh()
+    if not last_input_neutral then
+        return false
+    end
+    local age = config.blank_input_reuse_age
+    if not age or age <= 0 then
+        return false
+    end
+    return _cache.git_status_at ~= nil and (clock() - _cache.git_status_at) < age
+end
 
 local function dir_name()
     local cwd = _cache.cwd
     local base = basename_any_path(cwd)
     if base and #base > 0 then return base end
-    
+
     -- at drive root give readable name, e.g. for 'C:\' give 'C:'
     return cwd:match('^(%a:)') or cwd
 end
 
--- read a git config value; runs inside the prompt coroutine, at most once per session
+-- read a git config value; runs inside the status coroutine, at most once per session
 local function git_config_value(name)
     if not (git.makecommand and io.popenyield) then return nil end
     local cmd = git.makecommand('config --get ' .. name)
@@ -785,23 +997,23 @@ local function check_fsmonitor_hint(duration)
     fsmonitor_hint_done = true
     if not git_config_value('core.fsmonitor') then
         pending_hint = format(
-            'snapline: git status took >%.0fms %d times in a row - consider "git config core.fsmonitor true" and "git config core.untrackedCache true" for this repo',
+            'snapline: git status took >%.0fms %d times in a row - consider "git config core.fsmonitor true", "git config core.untrackedCache true" and "git maintenance start" for this repo',
             config.fsmonitor_hint_threshold * 1000, config.fsmonitor_hint_count)
     end
 end
 
-local function profile()
+-- async status collection
+--
+-- Each refresh runs in its own coroutine marked runcoroutineuntilcomplete, so
+-- unlike clink.promptcoroutine it survives Enter: on a slow repo the status
+-- lands on a later prompt instead of being canceled and restarted (and
+-- restarted...) by every command.  The result is applied to _cache only when
+-- the repo is still the same and no git-mutating input ran meanwhile.
+local status_inflight = nil    -- refresh currently collecting, nil when idle
+local inflight_count = 0       -- includes abandoned refreshes still finishing
+
+local function collect_profile()
     local response = {}
-    response.cwd = _cache.cwd
-
-    -- blank input can't change git state: reuse the last status while fresh
-    if last_input_blank and _cache.git_status_at and
-        config.blank_input_reuse_age and config.blank_input_reuse_age > 0 and
-        (clock() - _cache.git_status_at) < config.blank_input_reuse_age then
-        response.reused = true
-        return response
-    end
-
     -- duration is always measured since it drives the fsmonitor hint,
     -- config.profile only controls displaying it in the prompt
     response.duration = clock()
@@ -814,13 +1026,137 @@ local function profile()
     if config.stash_git_fallback and not _cache.stash_path and git.getstashcount then
         response.stash_count = to_int(git.getstashcount())
     end
-
     return response
+end
+
+local function apply_status_response(rec, response)
+    -- discard when the repo changed or a git-mutating command ran since the
+    -- collection started: the data describes a state that no longer exists
+    if rec.mutation ~= mutation_count or rec.git_dir ~= _cache.git_dir then
+        return
+    end
+    local info = response.info
+    if not info then
+        -- keep the old render but leave it marked stale: it was NOT refreshed
+        _cache.git_status_failed = true
+        return
+    end
+    _cache.git_status_failed = false
+    _cache.git_branch    = info.branch or _cache.git_branch
+    _cache.dirty_branch  = info.dirty_branch
+    _cache.dirty_dir     = info.dirty_dir
+    _cache.git_render_text = git_render(info)
+    _cache.git_status_at = response.finished_at or clock()
+    set_git_upstream_cache(info.upstream, info.branch)
+    if info.untracked_refreshed then
+        _cache.git_untracked_at = response.finished_at or clock()
+        _cache.git_untracked_count = info.untracked
+    end
+    if config.profile and response.duration then
+        _cache.git_duration = fmt_duration(response.duration)
+    end
+    if response.stash_count then
+        set_stash_cache(nil, nil, nil, response.stash_count)
+        set_stash_prompt(response.stash_count)
+    end
+end
+
+local function start_status_refresh()
+    if not _cache.git_dir then
+        return
+    end
+    if status_inflight then
+        if status_inflight.mutation == mutation_count and status_inflight.git_dir == _cache.git_dir then
+            -- a refresh for exactly this state is already collecting
+            return
+        end
+        status_inflight.abandoned = true
+        status_inflight = nil
+    end
+    if inflight_count >= 4 then
+        -- git is hanging (network repo?); don't pile up more processes
+        return
+    end
+
+    local rec = { git_dir = _cache.git_dir, mutation = mutation_count }
+    inflight_count = inflight_count + 1
+    rec.co = coroutine.create(function ()
+        local response = collect_profile()
+        inflight_count = inflight_count - 1
+        if status_inflight == rec then
+            status_inflight = nil
+        end
+        if not rec.abandoned then
+            apply_status_response(rec, response)
+            clink.refilterprompt()
+        end
+    end)
+    status_inflight = rec
+    -- clink auto-resumes created coroutines while editing is idle
+    if clink.setcoroutinename then clink.setcoroutinename(rec.co, 'snapline status') end
+    if clink.runcoroutineuntilcomplete then clink.runcoroutineuntilcomplete(rec.co) end
+end
+
+-- repo watcher: while idle at the prompt, µs-scale file probes detect git
+-- state changed by other terminals/editors and trigger an async refresh, so
+-- the prompt corrects itself without Enter
+local function repo_signature()
+    local gd = _cache.git_dir
+    if not gd then
+        return nil
+    end
+    local common = (git.getcommondir and git.getcommondir()) or gd
+    local sig = {}
+    sig[#sig + 1] = get_file_stamp(join_path(gd, 'index')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(gd, 'HEAD')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(gd, 'MERGE_HEAD')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(gd, 'rebase-merge')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(gd, 'rebase-apply')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(common, 'packed-refs')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(common, 'FETCH_HEAD')) or '-'
+    sig[#sig + 1] = get_file_stamp(join_path(join_path(join_path(common, 'logs'), 'refs'), 'stash')) or '-'
+    local branch = _cache.git_branch
+    if branch then
+        -- git forbids space, :, ?, *, [, \ and .. in ref names, so the loose
+        -- ref path is safe to probe directly ('/' works in Win32 file APIs)
+        sig[#sig + 1] = get_file_stamp(common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. branch) or '-'
+    end
+    return concat(sig, ';')
+end
+
+local function start_repo_watcher()
+    if not config.watch_repo or watcher_started or not _cache.git_dir then
+        return
+    end
+    watcher_started = true
+    -- created without runcoroutineuntilcomplete: clink cancels it when the
+    -- edit session ends, and the next session's filter starts a fresh one
+    local co = coroutine.create(function ()
+        local base = nil
+        while true do
+            coroutine.yield()
+            local ok, sig = pcall(repo_signature)
+            if not ok or not sig then
+                break
+            end
+            if base == nil then
+                base = sig
+            elseif sig ~= base then
+                base = sig
+                pcall(refresh_stash_cache)
+                pcall(refresh_fetch_age)
+                start_status_refresh()
+                clink.refilterprompt()
+            end
+        end
+    end)
+    if clink.setcoroutinename then clink.setcoroutinename(co, 'snapline watch') end
+    if clink.setcoroutineinterval then clink.setcoroutineinterval(co, config.watch_interval) end
 end
 
 local function git_left_prompt()
     local prompt_parts = {}
-    
+
     local branch = _cache.git_branch
     if branch then
         local branch_color = config.color.reset
@@ -829,17 +1165,17 @@ local function git_left_prompt()
         end
         prompt_parts[#prompt_parts+1] = branch_color .. config.branch_symbol .. branch .. config.color.reset
     end
-    
+
     -- https://github.com/chrisant996/clink/blob/master/clink/app/scripts/git.lua#L732
     -- rebase-i rebase-m rebase am am/rebase merging cherry-picking reverting bisecting
-    local action = git.getaction()
+    local action = git.getaction and git.getaction() or nil
     if action then
         -- forbidden symbols [-/]
         local action_key = action:gsub('[-/]', '_')
         local symbol = config.action_symbol[action_key] or config.action_symbol.unknown
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
-    
+
     return concat(prompt_parts, ' ')
 end
 
@@ -869,51 +1205,58 @@ local function errorlevel_prompt_char()
     return '> '
 end
 
+-- shell integration marks: https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration
+-- A = prompt start, B = input start, C = command output start, D = command
+-- done + exit code; OSC 9;9 reports cwd for duplicate-tab-in-same-directory
+local function shell_integration_beginedit()
+    if not config.shell_integration then
+        command_ran = false
+        return
+    end
+    local out = {}
+    if command_ran then
+        command_ran = false
+        local code = (os.geterrorlevel and os.geterrorlevel()) or 0
+        out[#out + 1] = format('\x1b]133;D;%d\x1b\\', code)
+    end
+    out[#out + 1] = '\x1b]9;9;' .. get_cwd() .. '\x1b\\'
+    clink.print(concat(out), NONL)
+end
+
 local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
--- true while the async status refresh is still pending for this prompt
+-- true while an async status refresh is still pending for the shown status
 local git_status_stale = false
--- left prompt, first in execution line so it contains async promptcoroutine
+-- left prompt, first in execution line so it kicks off the async refresh
 function pf:filter()
-    local response = clink.promptcoroutine(profile)
-    -- blank input can't invalidate the cached status, so it is never stale then
-    git_status_stale = response == nil and not last_input_blank
-    if response and response.info and response.cwd == _cache.cwd then
-        _cache.git_dir       = response.info.git_dir
-        _cache.git_branch    = response.info.branch
-        _cache.dirty_branch = response.info.dirty_branch
-        _cache.dirty_dir    = response.info.dirty_dir
-        _cache.git_render_text = git_render(response.info)
-        _cache.git_status_at = response.finished_at or clock()
-        set_git_upstream_cache(response.info.upstream, response.info.branch)
-        if response.info.untracked_refreshed then
-            _cache.git_untracked_at = response.finished_at or clock()
-            _cache.git_untracked_count = response.info.untracked
+    -- decide once per input line session; a refilter after an async apply
+    -- must not start another refresh or applies would loop forever
+    if _cache.git_dir and not session_refresh_started then
+        session_refresh_started = true
+        -- spawn git only when the cached status isn't provably fresh
+        if not git_status_is_fresh() then
+            start_status_refresh()
         end
     end
-    if config.profile and response and response.duration and response.cwd == _cache.cwd then
-        _cache.git_duration = fmt_duration(response.duration)
-    end
-    if response and response.stash_count and response.cwd == _cache.cwd then
-        set_stash_cache(nil, nil, nil, response.stash_count)
-        set_stash_prompt(response.stash_count)
-    end
-    
+    start_repo_watcher()
+    git_status_stale = _cache.git_dir ~= nil and
+        ((status_inflight ~= nil and status_inflight.git_dir == _cache.git_dir) or
+         _cache.git_status_failed)
+
     local dir_color = config.color.reset
     if _cache.dirty_dir ~= nil then
         dir_color = _cache.dirty_dir and config.color.dirty or config.color.clean
     end
-    
+
     local venv = _cache.venv
     local prompt_parts = {}
-    append_non_empty(prompt_parts, (venv and #venv > 0) and (config.color.venv .. '{' .. venv .. '}') or nil)
+    append_non_empty(prompt_parts, (venv and #venv > 0) and (config.color.venv .. '{' .. venv .. '}' .. config.color.reset) or nil)
     append_non_empty(prompt_parts, git_left_prompt())
     append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
     append_non_empty(prompt_parts, errorlevel_prompt_char())
     return concat(prompt_parts, ' ')
 end
--- right filter, second in execution line so it doesn't contain async calls
--- it uses cached values provided by the left prompt after its async call
+-- right filter, second in execution line, renders only cached values
 function pf:rightfilter()
     -- in a repo the status render must not be an empty string or the right
     -- prompt doesn't get redrawn after async! - with no glyphs still emit colors
@@ -926,6 +1269,9 @@ function pf:rightfilter()
             color = config.color.dirty
         end
         git_status_prompt = color .. _cache.git_render_text .. config.color.reset
+    elseif _cache.git_dir and git_status_stale then
+        -- first status for this repo is still collecting
+        git_status_prompt = config.color.took .. config.status_format.pending .. config.color.reset
     end
 
     local stash_prompt = _cache.stash_prompt or ''
@@ -935,6 +1281,7 @@ function pf:rightfilter()
     append_non_empty(prompt_parts, _cache.git_duration)
     append_non_empty(prompt_parts, git_status_prompt)
     append_non_empty(prompt_parts, _cache.git_upstream_prompt)
+    append_non_empty(prompt_parts, _cache.fetch_age_prompt)
     append_non_empty(prompt_parts, stash_prompt)
     append_non_empty(prompt_parts, _cache.python_prompt)
     append_non_empty(prompt_parts, fmt_last_cmd_duration())
@@ -950,7 +1297,108 @@ function pf:surround()
     -- 2K is the parameter + command: K = EL (Erase in Line), 2K = clear the entire line
 
     -- prefix, suffix, rprefix, rsuffix
-    return '\x1b[2K', '', '', ''
+    local prefix = '\x1b[2K'
+    local suffix = ''
+    if config.shell_integration then
+        -- re-marking A/B on every redraw is fine: marks apply to the redrawn spot
+        prefix = '\x1b]133;A\x1b\\' .. prefix
+        suffix = '\x1b]133;B\x1b\\'
+    end
+    return prefix, suffix, '', ''
+end
+-- transient prompt (opt-in via 'clink set prompt.transient always'): past
+-- prompts collapse to just the exit marker, keeping scrollback compact
+function pf:transientfilter()
+    return errorlevel_prompt_char()
+end
+function pf:transientrightfilter()
+    -- time when the command was submitted, replacing the live clock
+    return config.color.took .. date('%H:%M:%S') .. config.color.reset
+end
+
+-- benchmark Clink git API calls and snapline alternatives; typed as the
+-- 'snapline-bench' command at the prompt (runs blocking, a few seconds)
+local function time_loop(f, n)
+    local t = clock()
+    for _ = 1, n do
+        f()
+    end
+    return (clock() - t) / n
+end
+
+local function run_bench()
+    local n = 5
+    clink.print(config.color.took .. format('snapline bench: %d iterations per call, slow calls red', n) .. config.color.reset)
+    local rows = {
+        {'git.getaction',           git.getaction},
+        {'git.getgitdir',           git.getgitdir},
+        {'git.getcommondir',        git.getcommondir},
+        {'git.getbranch',           git.getbranch},
+        {'git.getremote',           git.getremote},
+        {'git.isgitdir',            git.isgitdir},
+        {'git.getsystemname',       git.getsystemname},
+        {'git.hasstash',            git.hasstash},
+        {'git.getstashcount',       git.getstashcount},
+        {'git.getaheadbehind',      git.getaheadbehind},
+        {'git.getstatus',           git.getstatus},
+        {'git.getconflictstatus',   git.getconflictstatus},
+        {'snapline hasstash',       hasstash},
+        {'snapline getstashcount',  getstashcount},
+        {'snapline collect_status', collect_status},
+    }
+    for i = 1, #rows do
+        local name, fn = rows[i][1], rows[i][2]
+        if fn then
+            local duration = time_loop(fn, n)
+            local color = duration > 0.01 and config.color.dirty or config.color.clean
+            clink.print(color .. format('%25s', name) .. '   ' .. fmt_duration(duration) .. config.color.reset)
+        end
+    end
+end
+
+local function bench_input_filter(text)
+    if text and text:match('^%s*snapline%-bench%s*$') then
+        run_bench()
+        return ''
+    end
+end
+
+-- event handlers; beginedit order matters: capture the command duration
+-- before the cache refreshes below add their own microseconds to it
+local function on_beginedit_timing()
+    if last_start then
+        last_dur_s = clock() - last_start
+        last_start = nil
+    end
+end
+
+local function on_endedit(line)
+    last_input_blank = not (line and line:find('%S'))
+    last_input_neutral = last_input_blank or is_status_neutral_input(line or '')
+    if not last_input_neutral then
+        mutation_count = mutation_count + 1
+    end
+    last_start = clock()
+    if not last_input_blank then
+        command_ran = true
+        if config.shell_integration then
+            clink.print('\x1b]133;C\x1b\\', NONL)
+        end
+    end
+end
+
+refresh_runtime_cache()
+refresh_stash_cache()
+refresh_fetch_age()
+
+clink.onbeginedit(on_beginedit_timing)
+clink.onbeginedit(shell_integration_beginedit)
+clink.onbeginedit(refresh_runtime_cache)
+clink.onbeginedit(refresh_stash_cache)
+clink.onbeginedit(refresh_fetch_age)
+clink.onendedit(on_endedit)
+if clink.onfilterinput then
+    clink.onfilterinput(bench_input_filter)
 end
 
 
@@ -962,9 +1410,9 @@ end
 -- print('staged    +          modified    !')
 -- print('renamed   »          deleted     X')
 -- print('tracked   ?          untracked   ??')
--- print('stashed   ≡')
+-- print('stashed   ≡          no fetch    ~')
 -- print()
--- 
+--
 -- print('int rebase      Ri        rebase merge  Rm')
 -- print('rebase          \239\129\162         mail split    \238\172\156')
 -- print('mail s. rebase  amR       merging       \243\176\189\156')
@@ -972,69 +1420,3 @@ end
 -- print('bisecting       \243\176\135\148')
 -- print()
 -- print()
-
--- benchmark clink git API calls
--- local function time_loop(f)
---     local duration, n = clock(), 10
---     for i = 1, n do
---         _ = f()
---     end
---     return (clock() - duration) / n
--- end
-
--- local function bench()
---     local funs = {
---         {'getaction',         git.getaction},
---         {'getgitdir',         git.getgitdir},
---         {'hasstash',          git.hasstash},
---         {'getaheadbehind',    git.getaheadbehind},
---         {'getremote',         git.getremote},
---         {'isgitdir',          git.isgitdir},
---         {'getbranch',         git.getbranch},
---         {'getstashcount',     git.getstashcount},
---         {'getcommondir',      git.getcommondir},
---         {'getstatus',         git.getstatus},
---         {'getconflictstatus', git.getconflictstatus},
---         {'getsystemname',     git.getsystemname},
---     }
---     for i = 1, #funs do
---         duration = time_loop(funs[i][2])
---         duration_color = duration>0.01 and config.color.dirty or config.color.clean
---         print(duration_color .. format('%18s', funs[i][1]) .. '   ' .. fmt_duration(duration))
---     end
---     print()
--- end
--- clink.onbeginedit(function ()
---     bench()
--- end)
-
--- benchmark alternative fast functions
--- local function bench_alt()
---     local funs = {
---         {'',              nil},
---         {'',              nil},
---         {'hasstash',      hasstash},
---         {'',              nil},
---         {'',              nil},
---         {'',              nil},
---         {'',              nil},
---         {'getstashcount', getstashcount},
---         {'',              nil},
---         {'',              nil},
---         {'',              nil},
---         {'',              nil},
---     }
---     for i = 1, #funs do
---         if not funs[i][2] then
---             print()
---         else
---             duration = time_loop(funs[i][2])
---             duration_color = duration>0.01 and config.color.dirty or config.color.clean
---             print(duration_color .. format('%18s', funs[i][1]) .. '   ' .. fmt_duration(duration))
---         end
---     end
---     print()
--- end
--- clink.onbeginedit(function ()
---     bench_alt()
--- end)
