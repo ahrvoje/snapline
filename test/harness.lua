@@ -211,6 +211,12 @@ local PORC_STAGED = table.concat({
     '# branch.ab +0 -0',
     '1 M. N... 100644 100644 100644 aaa bbb file0.txt',
 }, '\n')
+local PORC_AHEAD = table.concat({
+    '# branch.oid 1234567890abcdef',
+    '# branch.head main',
+    '# branch.upstream origin/main',
+    '# branch.ab +1 -0',
+}, '\n')
 local PORC_AB_UNKNOWN = table.concat({
     '# branch.oid 1234567890abcdef',
     '# branch.head main',
@@ -395,6 +401,29 @@ check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
     'ahead count cleared after push, status neutral')
 tick()
 check(P.calls == calls0 + 2, 'watcher stable after push refresh (no spawn loop)')
+
+-- T11c push lands while a commit-triggered refresh is still collecting:
+-- the in-flight (pre-push) data must be abandoned, not deduped against
+P.porcelain = PORC_AHEAD
+P.slow = true
+fh = io.open(REPO_GD .. '\\index', 'ab')
+fh:write('y'); fh:close()
+tick()  -- watcher detects the commit, starts slow refresh A
+tick()  -- A spawns git (captures pre-push ahead output) and yields mid-read
+local c11c = P.calls
+-- different size on purpose: the harness runs within one mtime tick, and
+-- the stamp is size:mtime (a real push comes seconds later at least)
+fh = io.open(REPO_GD .. '\\refs\\remotes\\origin\\main', 'wb')
+fh:write('def456def456\n'); fh:close()
+P.porcelain = PORC_STAGED
+P.slow = false
+tick()  -- watcher detects the push mid-flight: A abandoned, B started
+tick()  -- B collects post-push state and applies
+check(P.calls == c11c + 1, 'mid-flight repo change started a replacement refresh')
+right = H.pf:rightfilter()
+pright = plain(right)
+check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
+    'abandoned pre-push data not applied, status neutral')
 
 -- T12 snapline-bench consumes the input line
 local before_bench = #H.printed

@@ -873,8 +873,9 @@ local last_start, last_dur_s
 local last_input_blank = false
 -- true when the last input provably couldn't change git state
 local last_input_neutral = false
--- bumped whenever an input line may have changed git state; an async status
--- collection is applied only when the count it started with is still current
+-- bumped whenever an input line (or a repo change seen by the watcher) may
+-- have changed git state; an async status collection is applied only when
+-- the count it started with is still current
 local mutation_count = 0
 
 -- commands that can't change git state as long as no redirection is involved
@@ -1144,6 +1145,11 @@ local function start_repo_watcher()
                 base = sig
             elseif sig ~= base then
                 base = sig
+                -- a status still collecting started before this on-disk
+                -- change, so its data is already outdated: counting the
+                -- change as a mutation makes start_status_refresh abandon
+                -- it and collect anew instead of deduplicating against it
+                mutation_count = mutation_count + 1
                 pcall(refresh_stash_cache)
                 pcall(refresh_fetch_age)
                 start_status_refresh()
