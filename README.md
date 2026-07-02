@@ -43,6 +43,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
     <p align="center"><img src="resources/action_legend.png" width="720"></p>
   * status legend
     <p align="center"><img src="resources/status_legend.png" width="600"></p>
+  * type ```snapline-legend``` at the prompt to print both legends with your configured glyphs
 
 ## Examples
 

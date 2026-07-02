@@ -387,6 +387,18 @@ local bench_out = table.concat(H.printed, '\n', before_bench + 1)
 check(bench_out:find('snapline bench', 1, true) ~= nil, 'bench printed results')
 check(bench_out:find('collect_status', 1, true) ~= nil, 'bench included snapline alternatives')
 
+-- T13 snapline-legend prints the configured glyphs
+local before_legend = #H.printed
+replaced = endedit('snapline-legend')
+check(replaced == '', 'snapline-legend replaced with empty command line')
+local legend_out = table.concat(H.printed, '\n', before_legend + 1)
+check(legend_out:find('diverged', 1, true) ~= nil and legend_out:find('⇕⇡A⇣B', 1, true) ~= nil,
+    'legend shows composed diverged sample')
+check(legend_out:find('untracked', 1, true) ~= nil and legend_out:find('??N', 1, true) ~= nil,
+    'legend fills count placeholders')
+check(legend_out:find('bisecting', 1, true) ~= nil and legend_out:find('~Nd', 1, true) ~= nil,
+    'legend covers actions and fetch age')
+
 -- =====================================================================
 print('===== suite 2: transient prompt + no-ahead-behind =====')
 load_snapline({ ahead_behind = false })

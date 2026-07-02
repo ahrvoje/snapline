@@ -7,6 +7,7 @@
 --          '…' first status for this repo is still collecting     '~Nd' time since last fetch
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect
 -- Exit code marker: red '✗N >' when the last command failed (negative codes shown as hex NTSTATUS)
+-- Type 'snapline-legend' at the prompt to print the glyph legend for the active config.
 -- Type 'snapline-bench' at the prompt to benchmark Clink git API calls vs snapline alternatives.
 
 local clock  = os.clock      -- Clink clock returning seconds with us precision
@@ -882,7 +883,7 @@ local NEUTRAL_CMDS = {
     ver = true, vol = true, help = true, whoami = true, hostname = true,
     title = true, rem = true, cd = true, chdir = true, pushd = true,
     popd = true, more = true, tree = true, find = true, findstr = true,
-    ['snapline-bench'] = true,
+    ['snapline-bench'] = true, ['snapline-legend'] = true,
 }
 -- read-only git subcommands; fetch/pull/push are excluded on purpose since
 -- they move ahead/behind, and branch/tag/remote/config since they can mutate
@@ -1323,9 +1324,61 @@ local function run_bench()
     end
 end
 
-local function bench_input_filter(text)
+-- print the action and status glyph legend built from the active config, so
+-- it always shows the configured glyphs; typed as the 'snapline-legend' command
+local function run_legend()
+    local fmt, act, col = config.status_format, config.action_symbol, config.color
+
+    -- pad to visible width: nerd glyphs are 3-4 bytes but render as 1-2 cells
+    local function pad(s, width)
+        local cells = (console and console.cellcount) and console.cellcount(s) or #s
+        return s .. (' '):rep(width > cells and width - cells or 1)
+    end
+    -- replace the count placeholder in a status format, e.g. '⇡%d' > '⇡N'
+    local function sample(f, n)
+        return (f:gsub('%%[ds]', n or 'N'))
+    end
+    local function print_rows(title, color, rows)
+        clink.print(col.took .. title .. col.reset)
+        for i = 1, #rows do
+            local r = rows[i]
+            local line = '  ' .. pad(r[1], 16) .. color .. pad(r[2], 10) .. col.reset
+            if r[3] then
+                line = line .. pad(r[3], 16) .. color .. r[4] .. col.reset
+            end
+            clink.print(line)
+        end
+    end
+
+    print_rows('status', col.clean, {
+        { 'ahead',          sample(fmt.ahead),          'behind',     sample(fmt.behind) },
+        { 'diverged',       fmt.diverged .. sample(fmt.ahead, 'A') .. sample(fmt.behind, 'B'),
+                                                        'conflicted', sample(fmt.conflicted) },
+        { 'staged',         sample(fmt.staged),         'modified',   sample(fmt.modified) },
+        { 'renamed',        sample(fmt.renamed),        'deleted',    sample(fmt.deleted) },
+        { 'tracked',        sample(fmt.tracked),        'untracked',  sample(fmt.untracked) },
+        { 'stashed',        sample(fmt.stashed),        'ab unknown', fmt.ab_unknown },
+        { 'fetch age',      sample(fmt.fetch_age, 'Nd'), 'collecting', fmt.pending },
+    })
+    print_rows('action', col.state, {
+        { 'int rebase',     act.rebase_i,       'rebase merge', act.rebase_m },
+        { 'rebase',         act.rebase,         'mail split',   act.am },
+        { 'mail s. rebase', act.am_rebase,      'merging',      act.merging },
+        { 'cherry-picking', act.cherry_picking, 'reverting',    act.reverting },
+        { 'bisecting',      act.bisecting,      'unknown',      act.unknown },
+    })
+    print_rows('marks', col.reset, {
+        { 'branch',         config.branch_symbol, 'exit code',  config.error_symbol .. 'N' },
+    })
+end
+
+local function command_input_filter(text)
     if text and text:match('^%s*snapline%-bench%s*$') then
         run_bench()
+        return ''
+    end
+    if text and text:match('^%s*snapline%-legend%s*$') then
+        run_legend()
         return ''
     end
 end
@@ -1358,25 +1411,5 @@ clink.onbeginedit(refresh_stash_cache)
 clink.onbeginedit(refresh_fetch_age)
 clink.onendedit(on_endedit)
 if clink.onfilterinput then
-    clink.onfilterinput(bench_input_filter)
+    clink.onfilterinput(command_input_filter)
 end
-
-
-
-------------------------------- MISC -------------------------------
--- action and status legend
--- print('diverged  ⇕          ahead       ⇡')
--- print('behind    ⇣          conflicted  \243\177\144\139')
--- print('staged    +          modified    !')
--- print('renamed   »          deleted     X')
--- print('tracked   ?          untracked   ??')
--- print('stashed   ≡          no fetch    ~')
--- print()
---
--- print('int rebase      Ri        rebase merge  Rm')
--- print('rebase          \239\129\162         mail split    \238\172\156')
--- print('mail s. rebase  amR       merging       \243\176\189\156')
--- print('cherry-picking  \238\138\155         reverting     \239\129\160')
--- print('bisecting       \243\176\135\148')
--- print()
--- print()
