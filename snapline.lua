@@ -1114,6 +1114,14 @@ local function repo_signature()
         -- ref path is safe to probe directly ('/' works in Win32 file APIs)
         sig[#sig + 1] = get_file_stamp(common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. branch) or '-'
     end
+    -- push moves only the remote-tracking ref, nothing else in .git changes:
+    -- without this probe the ahead count stalls after a push
+    local key = _cache.git_upstream_key
+    if key then
+        local nul = key:find('\0', 1, true)
+        local upstream = nul and key:sub(1, nul - 1) or key
+        sig[#sig + 1] = get_file_stamp(common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'remotes' .. PATH_SEP .. upstream) or '-'
+    end
     return concat(sig, ';')
 end
 

@@ -379,6 +379,23 @@ check(H.refilters == ref1 + 2, 'watcher-triggered status applied and refiltered'
 tick()
 check(P.calls == calls0 + 1, 'watcher stable after refresh (no spawn loop)')
 
+-- T11b push from another terminal: only the remote-tracking ref moves,
+-- ahead count must clear without Enter
+os.execute('cmd /c mkdir "' .. REPO_GD .. '\\refs\\remotes\\origin" 2>nul')
+fh = io.open(REPO_GD .. '\\refs\\remotes\\origin\\main', 'wb')
+fh:write('abc123\n'); fh:close()
+P.porcelain = PORC_STAGED
+tick()
+check(H.refilters == ref1 + 3, 'watcher detected remote-tracking ref update (push)')
+tick()
+check(P.calls == calls0 + 2, 'push-triggered status ran')
+right = H.pf:rightfilter()
+pright = plain(right)
+check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
+    'ahead count cleared after push, status neutral')
+tick()
+check(P.calls == calls0 + 2, 'watcher stable after push refresh (no spawn loop)')
+
 -- T12 snapline-bench consumes the input line
 local before_bench = #H.printed
 local replaced = endedit('snapline-bench')
