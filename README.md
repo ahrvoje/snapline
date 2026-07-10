@@ -11,8 +11,9 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Status-neutral commands (```cls```, ```dir```, ```type```, ```git log```, ```git diff```, ... with no redirection) also reuse the last status - most prompts spawn nothing.
   * ```cd``` within the same repo carries the status over - git status is repo-wide, so no blank flash and no extra git run.
   * Async status survives Enter: on a slow repo the refresh lands on a later prompt instead of being canceled and restarted by every command.
-  * Idle repo watcher notices commits made from other terminals/editors (µs-scale ```.git``` file probes) and refreshes the prompt by itself - no Enter needed.
+  * Idle repo watcher notices commits made from other terminals/editors (µs-scale content fingerprints, including reftable repositories) and refreshes the prompt by itself - no Enter needed.
   * Async status runs with ```--no-optional-locks``` so it never takes ```index.lock``` and never collides with git commands typed at the prompt.
+  * Stash count is collected by the existing async porcelain status process; no synchronous stash probe or extra process is needed.
   * One-time hint to enable ```core.fsmonitor``` when git status is repeatedly slow.
   * Benchmark of Clink methods, and alternative implementations; red are only called async.
     Type ```snapline-bench``` at the prompt to re-measure on your machine.
@@ -21,7 +22,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
 ### Left prompt
   * virtual environment in yellow
   * git branch
-  * git in-progress action
+  * git in-progress action; rebase and mail-apply actions include step/total progress when available, e.g. ```Ri3/12```
   * current working directory
     * no-repo in white
     * clean in green
@@ -65,8 +66,14 @@ Past prompts can collapse to just the exit marker (```> ``` or ```✗1 > ```) wi
 
 ## Configuration
 
-All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, repo watcher, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file.
+All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, repo watcher, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file. Partial ```color```, ```status_format```, and ```action_symbol``` tables are merged with their defaults. Invalid or unknown options are ignored with a one-time message.
 
 ## Installation
 
-Copy the ```.lua``` file into Clink configuration folder. Ensure terminal uses Nerd Fonts. Requires Clink 1.7.0 or newer (the script silently no-ops on older versions).
+Copy the ```.lua``` file into Clink configuration folder. Ensure terminal uses Nerd Fonts. Requires Clink 1.7.0 or newer (the script silently no-ops on older versions). When another ```.clinkprompt``` is selected, Snapline automatically stands down instead of mixing two prompts.
+
+## Tests
+
+Run the integration-style harness with Clink's Lua runtime:
+
+    clink lua test\harness.lua

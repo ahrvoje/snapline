@@ -68,8 +68,10 @@ end
 local H  -- per-suite harness state
 local G = {}  -- git repo state
 local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
+            raise = false, stash_count = 2, config_value = '',
             errorlevel = 0, aliases = {} }
 local CWD = { path = 'C:\\work\\proj' }
+local NOW = 1000
 
 local real_create = coroutine.create
 coroutine.create = function (f)
@@ -88,6 +90,7 @@ local function make_clink_stub()
         runcoroutineuntilcomplete = function (co) H.keep[co] = true end,
         setcoroutineinterval = function () end,
         setcoroutinename = function () end,
+        getclinkprompt = function () return H.active_prompt end,
         print = function (...)
             local parts = {}
             local args = {...}
@@ -103,8 +106,11 @@ local function make_git_stub()
     return {
         getgitdir = function () return G.gitdir end,
         getcommondir = function () return G.commondir or G.gitdir end,
-        getbranch = function () return G.branch end,
-        getaction = function () return G.action end,
+        getbranch = function (git_dir, fast)
+            G.branch_git_dir, G.branch_fast = git_dir, fast
+            return G.branch
+        end,
+        getaction = function () return G.action, G.action_step, G.action_total end,
         makecommand = function (cmd) return 'git --no-optional-locks ' .. cmd .. ' 2>nul' end,
         getremote = function () return 'origin' end,
         isgitdir = function () return G.gitdir ~= nil end,
@@ -121,10 +127,24 @@ io.popenyield = function (cmd)
     P.calls = P.calls + 1
     P.lastcmd = cmd
     local out = ''
-    if cmd:find('status --porcelain', 1, true) then out = P.porcelain end
+    if cmd:find('status --porcelain', 1, true) then
+        local lines = {}
+        for line in P.porcelain:gmatch('[^\r\n]+') do
+            if not (cmd:find('--untracked-files=no ', 1, true) and line:sub(1, 1) == '?') then
+                lines[#lines + 1] = line
+            end
+        end
+        if P.stash_count and P.stash_count > 0 then
+            lines[#lines + 1] = '# stash ' .. P.stash_count
+        end
+        out = table.concat(lines, '\n')
+    elseif cmd:find('config --get', 1, true) then
+        out = P.config_value or ''
+    end
     local yielded = false
     local file = {
         read = function ()
+            if P.raise then error('simulated popen read failure') end
             if P.slow and not yielded then
                 yielded = true
                 coroutine.yield()
@@ -141,6 +161,7 @@ os.getcwd = function () return CWD.path end
 os.getenv = function () return nil end
 os.geterrorlevel = function () return P.errorlevel end
 os.getaliases = function () return P.aliases end
+os.clock = function () return NOW end
 
 -- ===== session simulation =====
 local function beginedit()
@@ -183,14 +204,18 @@ end
 
 local function load_snapline(overrides)
     H = { cos = {}, keep = {}, beginedit = {}, endedit = {}, filterinput = {},
-          refilters = 0, printed = {}, pf = nil }
+          refilters = 0, printed = {}, pf = nil, active_prompt = '' }
     rawset(_G, 'snapline_config', overrides)
     rawset(_G, 'clink', make_clink_stub())
     rawset(_G, 'git', make_git_stub())
     G.gitdir, G.branch, G.action, G.commondir = nil, nil, nil, nil
+    G.action_step, G.action_total = nil, nil
+    G.branch_git_dir, G.branch_fast = nil, nil
     P.calls, P.lastcmd, P.porcelain = 0, '', ''
-    P.fail, P.slow, P.errorlevel, P.aliases = false, false, 0, {}
+    P.fail, P.slow, P.raise, P.stash_count = false, false, false, 2
+    P.config_value, P.errorlevel, P.aliases = '', 0, {}
     CWD.path = 'C:\\work\\proj'
+    NOW = 1000
     dofile(SNAPLINE)
 end
 
@@ -233,23 +258,40 @@ check(H.pf ~= nil and H.pf.filter ~= nil, 'snapline loaded and registered a prom
 beginedit()
 local left  = H.pf:filter()
 local right = H.pf:rightfilter()
+check(left ~= nil, 'empty getclinkprompt value keeps snapline active')
 check(plain(left):find('proj > ', 1, true) ~= nil, 'non-repo left prompt shows dir and marker')
 check(plain(right):match('%d%d:%d%d:%d%d') ~= nil, 'right prompt shows clock')
 check(P.calls == 0, 'no git spawned outside a repo')
 
+-- Last-command duration is content-width, not padded to a fixed field.
+endedit('echo duration')
+NOW = NOW + 0.007
+beginedit()
+right = plain(H.pf:rightfilter())
+check(right:match('^7ms %d%d:%d%d:%d%d$') ~= nil,
+    'single-digit duration has no leading empty space')
+
 -- T2 first status in a repo
 G.gitdir, G.branch = REPO_GD, 'main'
+G.action, G.action_step, G.action_total = 'rebase-i', 3, 12
 P.porcelain = PORC_DIRTY
 endedit('git checkout main')
 beginedit()
 left  = H.pf:filter()
 right = H.pf:rightfilter()
 check(plain(left):find('main', 1, true) ~= nil, 'left prompt shows branch')
+check(plain(left):find('Ri3/12', 1, true) ~= nil, 'left prompt shows action step/total progress')
+check(G.branch_git_dir == REPO_GD and G.branch_fast == true,
+    'branch lookup reuses git dir and requests nonblocking fast mode')
 check(plain(right):find('…', 1, true) ~= nil, 'placeholder … while first status collects')
 check(color_at(right, '…') == DIM_SGR, 'placeholder is dimmed')
 check(P.calls == 0, 'prompt render spawned nothing synchronously')
 tick()
 check(P.calls == 1, 'exactly one git status ran')
+check(P.lastcmd:find('--show-stash', 1, true) ~= nil, 'status command collects stash count')
+check(P.lastcmd:find('--ignore-submodules=dirty', 1, true) ~= nil and
+      P.lastcmd:find('--ignore-submodules=all', 1, true) == nil,
+    'status preserves changed submodule commits without scanning nested dirt')
 check(H.refilters == 1, 'async apply refiltered the prompt')
 left  = H.pf:filter()
 right = H.pf:rightfilter()
@@ -260,12 +302,13 @@ check(pright:find('!1', 1, true) and pright:find('+1', 1, true) and pright:find(
     'modified/staged/untracked counts rendered')
 check(color_at(right, '⇕⇡1⇣2') == DIRTY_SGR, 'dirty status rendered red')
 check(color_at(left, 'main') == DIRTY_SGR, 'dirty branch rendered red')
-check(pright:find('≡2', 1, true) ~= nil, 'stash count read from stash reflog')
+check(pright:find('≡2', 1, true) ~= nil, 'stash count parsed from porcelain status')
 check(pright:find('~5d', 1, true) ~= nil, 'fetch age shown for old FETCH_HEAD')
 check(pright:find('origin', 1, true) ~= nil and pright:find('origin/main', 1, true) == nil,
     'upstream abbreviated to remote name')
 
 -- T3 blank Enter reuse
+G.action, G.action_step, G.action_total = nil, nil, nil
 endedit('')
 beginedit()
 H.pf:filter()
@@ -307,6 +350,21 @@ check(P.calls == c5 + 3, 'doskey-shadowed neutral command forces a refresh')
 H.pf:filter()
 P.aliases = {}
 
+-- A potentially mutating command must force a full untracked scan even when
+-- the previous full scan was less than two seconds ago.
+local cu = P.calls
+P.porcelain = PORC_DIRTY
+P.stash_count = 0
+endedit('echo x > newfile.txt')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == cu + 1, 'mutating command triggered status immediately')
+check(P.lastcmd:find('--untracked-files=normal', 1, true) ~= nil,
+    'mutating command invalidated throttled untracked count')
+right = H.pf:rightfilter()
+check(plain(right):find('??1', 1, true) ~= nil, 'new untracked entry shown immediately')
+check(plain(right):find('≡', 1, true) == nil, 'zero porcelain stash count clears cached stash')
+P.porcelain = PORC_STAGED
+
 -- T6 in-flight refresh crossing sessions: abandoned on mutation
 P.slow = true
 local c6 = P.calls
@@ -332,11 +390,27 @@ H.pf:filter()
 right = H.pf:rightfilter()
 check(color_at(right, '+1') == DIM_SGR, 'failed refresh leaves status dimmed')
 P.fail = false
-endedit('git add d')
+local failed_calls = P.calls
+endedit('')
 beginedit(); H.pf:filter(); tick()
+check(P.calls == failed_calls + 1, 'blank Enter retries a failed refresh despite fresh old cache')
 H.pf:filter()
 right = H.pf:rightfilter()
-check(color_at(right, '+1') == DIRTY_SGR, 'status recovers after next successful refresh')
+check(color_at(right, '+1') == DIRTY_SGR, 'status recovers after blank-Enter retry')
+
+-- Exceptions inside collection must clean up inflight bookkeeping and permit
+-- the following session to retry normally.
+P.raise = true
+endedit('git add throws')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+right = H.pf:rightfilter()
+check(color_at(right, '+1') == DIM_SGR, 'collection exception leaves cached status visibly stale')
+P.raise = false
+local raised_calls = P.calls
+endedit('')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == raised_calls + 1, 'collection exception cleaned up and retried next session')
+check(color_at(H.pf:rightfilter(), '+1') == DIRTY_SGR, 'status recovers after collection exception')
 
 -- T8 upstream with unknown ahead/behind
 P.porcelain = PORC_AB_UNKNOWN
@@ -373,12 +447,10 @@ P.porcelain = PORC_DIRTY
 endedit('cd C:\\work\\proj')
 beginedit(); H.pf:filter(); tick(); H.pf:filter()
 local calls0, ref1 = P.calls, H.refilters
-tick()
-check(P.calls == calls0, 'watcher baseline tick spawns nothing')
 local fh = io.open(REPO_GD .. '\\index', 'ab')
 fh:write('x'); fh:close()
 tick()
-check(H.refilters == ref1 + 1, 'watcher detected external .git change, refiltered immediately')
+check(H.refilters == ref1 + 1, 'watcher detects change before its first probe')
 tick()
 check(P.calls == calls0 + 1, 'watcher-triggered status ran')
 check(H.refilters == ref1 + 2, 'watcher-triggered status applied and refiltered')
@@ -402,6 +474,59 @@ check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
 tick()
 check(P.calls == calls0 + 2, 'watcher stable after push refresh (no spawn loop)')
 
+-- A ref rewrite normally keeps the same size and can share the same whole-
+-- second mtime.  Content fingerprints must still notice it.
+local same_size_calls, same_size_refilters = P.calls, H.refilters
+fh = io.open(REPO_GD .. '\\refs\\remotes\\origin\\main', 'wb')
+fh:write('def456\n'); fh:close()
+P.porcelain = PORC_AHEAD
+tick()
+check(H.refilters == same_size_refilters + 1, 'watcher detects same-size ref rewrite')
+tick()
+check(P.calls == same_size_calls + 1, 'same-size ref rewrite triggered status')
+check(plain(H.pf:rightfilter()):find('⇡1', 1, true) ~= nil,
+    'same-size ref rewrite applied updated ahead state')
+tick()
+
+-- Reftable stacks change through tables.list rather than loose refs.
+os.execute('cmd /c mkdir "' .. REPO_GD .. '\\reftable" 2>nul')
+fh = io.open(REPO_GD .. '\\reftable\\tables.list', 'wb')
+fh:write('one.ref\n'); fh:close()
+local reftable_calls = P.calls
+tick(); tick()
+check(P.calls == reftable_calls + 1, 'watcher detects reftable stack creation')
+fh = io.open(REPO_GD .. '\\reftable\\tables.list', 'wb')
+fh:write('two.ref\n'); fh:close()
+reftable_calls = P.calls
+tick(); tick()
+check(P.calls == reftable_calls + 1, 'watcher detects same-size reftable stack rewrite')
+tick()
+
+-- Rebase progress files are watched by content so progress updates while idle.
+os.execute('cmd /c mkdir "' .. REPO_GD .. '\\rebase-merge" 2>nul')
+fh = io.open(REPO_GD .. '\\rebase-merge\\msgnum', 'wb')
+fh:write('1\n'); fh:close()
+fh = io.open(REPO_GD .. '\\rebase-merge\\end', 'wb')
+fh:write('3\n'); fh:close()
+G.action, G.action_step, G.action_total = 'rebase-i', 1, 3
+local action_calls = P.calls
+tick()
+check(plain(H.pf:filter()):find('Ri1/3', 1, true) ~= nil,
+    'watcher renders newly started action progress immediately')
+tick()
+check(P.calls == action_calls + 1, 'new action state triggered status')
+tick()
+fh = io.open(REPO_GD .. '\\rebase-merge\\msgnum', 'wb')
+fh:write('2\n'); fh:close()
+G.action_step = 2
+action_calls = P.calls
+tick()
+check(plain(H.pf:filter()):find('Ri2/3', 1, true) ~= nil,
+    'watcher detects same-size action progress rewrite')
+tick()
+check(P.calls == action_calls + 1, 'action progress rewrite triggered status')
+tick()
+
 -- T11c push lands while a commit-triggered refresh is still collecting:
 -- the in-flight (pre-push) data must be abandoned, not deduped against
 P.porcelain = PORC_AHEAD
@@ -411,8 +536,6 @@ fh:write('y'); fh:close()
 tick()  -- watcher detects the commit, starts slow refresh A
 tick()  -- A spawns git (captures pre-push ahead output) and yields mid-read
 local c11c = P.calls
--- different size on purpose: the harness runs within one mtime tick, and
--- the stamp is size:mtime (a real push comes seconds later at least)
 fh = io.open(REPO_GD .. '\\refs\\remotes\\origin\\main', 'wb')
 fh:write('def456def456\n'); fh:close()
 P.porcelain = PORC_STAGED
@@ -444,6 +567,17 @@ check(legend_out:find('untracked', 1, true) ~= nil and legend_out:find('??N', 1,
     'legend fills count placeholders')
 check(legend_out:find('bisecting', 1, true) ~= nil and legend_out:find('~Nd', 1, true) ~= nil,
     'legend covers actions and fetch age')
+check(legend_out:find('RiN/M', 1, true) ~= nil, 'legend explains action progress suffix')
+
+-- A regular .lua prompt must stand down while a selected .clinkprompt is active.
+H.active_prompt = 'other-prompt'
+local inactive_calls = P.calls
+beginedit()
+check(H.pf:filter() == nil and H.pf:rightfilter() == nil and H.pf:surround() == nil,
+    'snapline filters stand down for an active clinkprompt')
+tick()
+check(P.calls == inactive_calls, 'inactive snapline starts no status work')
+H.active_prompt = nil
 
 -- =====================================================================
 print('===== suite 2: transient prompt + no-ahead-behind =====')
@@ -465,6 +599,40 @@ P.porcelain = PORC_AB_UNKNOWN
 beginedit(); H.pf:filter(); tick(); H.pf:filter()
 check(P.lastcmd:find('--no-ahead-behind', 1, true) ~= nil, 'status command has --no-ahead-behind')
 check(plain(H.pf:rightfilter()):find('⇡?', 1, true) ~= nil, 'ab_unknown rendered with ahead_behind=false')
+
+-- =====================================================================
+print('===== suite 3: safe partial configuration =====')
+load_snapline({
+    status_format = { ahead = 'UP%d', modified = '%' },
+    color = { clean = '\27[32m' },
+    untracked_refresh_interval = 'invalid',
+    not_a_snapline_option = true,
+})
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_DIRTY
+check(#H.printed == 0, 'config warnings deferred until a real prompt boundary')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+right = H.pf:rightfilter()
+check(plain(right):find('UP1', 1, true) ~= nil, 'partial nested format override merged with defaults')
+check(plain(right):find('!1', 1, true) ~= nil, 'invalid nested format retained its safe default')
+check(plain(right):find('≡2', 1, true) ~= nil, 'unspecified nested stash format retained')
+local warning_text = table.concat(H.printed, '\n')
+check(warning_text:find('status_format.modified', 1, true) ~= nil and
+      warning_text:find('untracked_refresh_interval', 1, true) ~= nil and
+      warning_text:find('not_a_snapline_option', 1, true) ~= nil,
+    'invalid and unknown config options reported once without crashing')
+
+-- =====================================================================
+print('===== suite 4: fsmonitor hint boolean handling =====')
+load_snapline({ fsmonitor_hint_threshold = 0, fsmonitor_hint_count = 1 })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_STAGED
+P.config_value = 'false\n'
+beginedit(); H.pf:filter(); tick()
+endedit(''); beginedit()
+local hint_text = table.concat(H.printed, '\n')
+check(hint_text:find('core.fsmonitor true', 1, true) ~= nil,
+    'explicit core.fsmonitor=false does not suppress performance hint')
 
 print('')
 print(string.format('%d tests, %d failures', tests, fails))
