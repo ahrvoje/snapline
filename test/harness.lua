@@ -8,21 +8,22 @@ local HERE = debug.getinfo(1, 'S').source:match('^@(.*[\\/])') or '.\\'
 local REPO_GD  = HERE .. 'fakerepo\\.git'
 local SNAPLINE = HERE .. '..\\snapline.lua'
 
+local function write_fixture(path, content)
+    local f = assert(io.open(path, 'wb'))
+    f:write(content)
+    f:close()
+end
+
 -- fixture tree with real files: stash reflog with 2 entries, FETCH_HEAD
 -- 5 days old (mtime set via powershell), index/HEAD/refs for the watcher
 do
-    local function write(path, content)
-        local f = assert(io.open(path, 'wb'))
-        f:write(content)
-        f:close()
-    end
     os.execute('cmd /c rmdir /s /q "' .. HERE .. 'fakerepo" 2>nul')
     os.execute('cmd /c mkdir "' .. REPO_GD .. '\\logs\\refs" "' .. REPO_GD .. '\\refs\\heads" 2>nul')
-    write(REPO_GD .. '\\index', 'DIRC fake index content')
-    write(REPO_GD .. '\\HEAD', 'ref: refs/heads/main\n')
-    write(REPO_GD .. '\\FETCH_HEAD', 'abc123 def456 fetched\n')
-    write(REPO_GD .. '\\logs\\refs\\stash', 'l1 stash@{0}\nl2 stash@{1}\n')
-    write(REPO_GD .. '\\refs\\heads\\main', 'abc123\n')
+    write_fixture(REPO_GD .. '\\index', 'DIRC fake index content')
+    write_fixture(REPO_GD .. '\\HEAD', 'ref: refs/heads/main\n')
+    write_fixture(REPO_GD .. '\\FETCH_HEAD', 'abc123 def456 fetched\n')
+    write_fixture(REPO_GD .. '\\logs\\refs\\stash', 'l1 stash@{0}\nl2 stash@{1}\n')
+    write_fixture(REPO_GD .. '\\refs\\heads\\main', 'abc123\n')
     os.execute('powershell -NoProfile -Command "(Get-Item \'' .. REPO_GD ..
         '\\FETCH_HEAD\').LastWriteTime = (Get-Date).AddDays(-5)" >nul')
 end
@@ -30,6 +31,7 @@ end
 local DIRTY_SGR = '\27[38;2;200;90;90m'
 local CLEAN_SGR = '\27[32m'
 local DIM_SGR   = '\27[38;5;242m'
+local REAL_CONSOLE = console
 
 local tests, fails = 0, 0
 local function check(cond, name)
@@ -69,7 +71,7 @@ local H  -- per-suite harness state
 local G = {}  -- git repo state
 local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
             raise = false, stash_count = 2, config_value = '',
-            errorlevel = 0, aliases = {} }
+            errorlevel = 0, aliases = {}, env = {} }
 local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
@@ -102,9 +104,21 @@ local function make_clink_stub()
     }
 end
 
+local function make_console_stub()
+    return {
+        cellcount = function (text)
+            local cells = REAL_CONSOLE and REAL_CONSOLE.cellcount and REAL_CONSOLE.cellcount(text)
+            return cells or #plain(text)
+        end,
+        getwidth = function () return H.console_width end,
+    }
+end
+
 local function make_git_stub()
     return {
-        getgitdir = function () return G.gitdir end,
+        getgitdir = function ()
+            return G.gitdir, G.workspace_dir or G.gitdir, G.root or CWD.path
+        end,
         getcommondir = function () return G.commondir or G.gitdir end,
         getbranch = function (git_dir, fast)
             G.branch_git_dir, G.branch_fast = git_dir, fast
@@ -158,7 +172,7 @@ io.popenyield = function (cmd)
 end
 
 os.getcwd = function () return CWD.path end
-os.getenv = function () return nil end
+os.getenv = function (name) return P.env[name] end
 os.geterrorlevel = function () return P.errorlevel end
 os.getaliases = function () return P.aliases end
 os.clock = function () return NOW end
@@ -204,16 +218,18 @@ end
 
 local function load_snapline(overrides)
     H = { cos = {}, keep = {}, beginedit = {}, endedit = {}, filterinput = {},
-          refilters = 0, printed = {}, pf = nil, active_prompt = '' }
+          refilters = 0, printed = {}, pf = nil, active_prompt = '', console_width = 200 }
     rawset(_G, 'snapline_config', overrides)
     rawset(_G, 'clink', make_clink_stub())
     rawset(_G, 'git', make_git_stub())
+    rawset(_G, 'console', make_console_stub())
     G.gitdir, G.branch, G.action, G.commondir = nil, nil, nil, nil
+    G.workspace_dir, G.root = nil, nil
     G.action_step, G.action_total = nil, nil
     G.branch_git_dir, G.branch_fast = nil, nil
     P.calls, P.lastcmd, P.porcelain = 0, '', ''
     P.fail, P.slow, P.raise, P.stash_count = false, false, false, 2
-    P.config_value, P.errorlevel, P.aliases = '', 0, {}
+    P.config_value, P.errorlevel, P.aliases, P.env = '', 0, {}, {}
     CWD.path = 'C:\\work\\proj'
     NOW = 1000
     dofile(SNAPLINE)
@@ -235,6 +251,12 @@ local PORC_STAGED = table.concat({
     '# branch.upstream origin/main',
     '# branch.ab +0 -0',
     '1 M. N... 100644 100644 100644 aaa bbb file0.txt',
+}, '\n')
+local PORC_CLEAN = table.concat({
+    '# branch.oid 1234567890abcdef',
+    '# branch.head main',
+    '# branch.upstream origin/main',
+    '# branch.ab +0 -0',
 }, '\n')
 local PORC_AHEAD = table.concat({
     '# branch.oid 1234567890abcdef',
@@ -568,6 +590,8 @@ check(legend_out:find('untracked', 1, true) ~= nil and legend_out:find('??N', 1,
 check(legend_out:find('bisecting', 1, true) ~= nil and legend_out:find('~Nd', 1, true) ~= nil,
     'legend covers actions and fetch age')
 check(legend_out:find('RiN/M', 1, true) ~= nil, 'legend explains action progress suffix')
+check(legend_out:find('index lock', 1, true) ~= nil and legend_out:find('sparse checkout', 1, true) ~= nil,
+    'legend covers exceptional repository states')
 
 -- A regular .lua prompt must stand down while a selected .clinkprompt is active.
 H.active_prompt = 'other-prompt'
@@ -633,6 +657,79 @@ endedit(''); beginedit()
 local hint_text = table.concat(H.printed, '\n')
 check(hint_text:find('core.fsmonitor true', 1, true) ~= nil,
     'explicit core.fsmonitor=false does not suppress performance hint')
+
+-- =====================================================================
+print('===== suite 5: adaptive layout + repository states =====')
+os.execute('cmd /c mkdir "' .. REPO_GD .. '\\info" 2>nul')
+write_fixture(REPO_GD .. '\\index.lock', 'owner')
+write_fixture(REPO_GD .. '\\shallow', 'abc123\n')
+write_fixture(REPO_GD .. '\\info\\sparse-checkout', '/*\n')
+
+load_snapline(nil)
+G.gitdir, G.branch, G.root = REPO_GD, 'main', 'C:\\work\\proj'
+P.porcelain = PORC_DIRTY
+P.env.VIRTUAL_ENV = 'C:\\envs\\demo'
+endedit('git checkout main')
+NOW = NOW + 0.007
+beginedit()
+left = H.pf:filter()
+tick()
+left = H.pf:filter()
+right = H.pf:rightfilter()
+local pleft, full_right = plain(left), plain(right)
+check(pleft:find('LOCK', 1, true) ~= nil and pleft:find('sh', 1, true) ~= nil and
+      pleft:find('sp', 1, true) ~= nil,
+    'index lock, shallow, and sparse states render from file probes')
+check(full_right:find('⇕⇡1⇣2', 1, true) ~= nil and full_right:find('origin', 1, true) ~= nil and
+      full_right:find('~5d', 1, true) ~= nil and full_right:find('py:venv', 1, true) ~= nil and
+      full_right:find('7ms', 1, true) ~= nil and full_right:match('%d%d:%d%d:%d%d') ~= nil,
+    'wide right prompt retains every segment')
+
+local essential = '⇕⇡1⇣2 !1 +1 ??1 ≡2'
+local left_cells = console.cellcount(left)
+H.console_width = left_cells + 4 + console.cellcount(essential)
+left = H.pf:filter()
+local narrow_right = plain(H.pf:rightfilter())
+check(narrow_right == essential,
+    'narrow right prompt drops ancillary fields but preserves git status and stash')
+H.console_width = left_cells + 4 + console.cellcount(essential) - 1
+left = H.pf:filter()
+check(H.pf:rightfilter() == '', 'right prompt hides only when essential git state cannot fit')
+H.console_width = 200
+
+P.porcelain = PORC_CLEAN
+P.stash_count = 0
+endedit('git reset --hard')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+local clean_right = plain(H.pf:rightfilter())
+check(clean_right:sub(1, 1) ~= ' ' and clean_right:match('^origin'),
+    'zero-width clean status adds no leading separator')
+
+local state_refilters = H.refilters
+os.remove(REPO_GD .. '\\index.lock')
+tick()
+check(H.refilters == state_refilters + 1 and plain(H.pf:filter()):find('LOCK', 1, true) == nil,
+    'watcher removes index-lock marker without Enter')
+os.remove(REPO_GD .. '\\shallow')
+os.remove(REPO_GD .. '\\info\\sparse-checkout')
+
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+G.commondir = REPO_GD .. '\\common'
+G.workspace_dir = 'C:\\work\\linked\\.git'
+CWD.path = 'C:\\work\\linked'
+beginedit()
+check(plain(H.pf:filter()):find(' wt ', 1, true) ~= nil,
+    'linked worktree marker derives from git/common directory identity')
+
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+G.workspace_dir = 'C:\\work\\super\\.git'
+G.root = 'C:\\work\\super\\sub'
+CWD.path = G.root
+beginedit()
+check(plain(H.pf:filter()):find(' sub ', 1, true) ~= nil,
+    'submodule marker derives from git workspace identity')
 
 print('')
 print(string.format('%d tests, %d failures', tests, fails))

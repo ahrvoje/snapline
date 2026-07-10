@@ -7,6 +7,7 @@
 --          '…' first status for this repo is still collecting     '~Nd' time since last fetch
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect;
 -- rebase/am operations include progress when Git exposes it, e.g. Ri3/12.
+-- Repository markers: LOCK=index lock, sh=shallow, sp=sparse, wt=linked worktree, sub=submodule.
 -- Exit code marker: red '✗N >' when the last command failed (negative codes shown as hex NTSTATUS)
 -- Type 'snapline-legend' at the prompt to print the glyph legend for the active config.
 -- Type 'snapline-bench' at the prompt to benchmark Clink git API calls vs snapline alternatives.
@@ -27,10 +28,18 @@ local function get_init_cache()
         venv = nil,
         git_dir = nil,
         git_common_dir = nil,
+        git_workspace_dir = nil,
+        git_root = nil,
         git_branch = nil,
         git_action = nil,
         git_action_step = nil,
         git_action_total = nil,
+        git_is_worktree = false,
+        git_is_submodule = false,
+        git_index_locked = false,
+        git_is_shallow = false,
+        git_is_sparse = false,
+        git_state_prompt = '',
         git_upstream_key = nil,
         git_upstream_prompt = '',
         git_untracked_at = nil,
@@ -127,6 +136,14 @@ local config = {
         bisecting      = '\243\176\135\148',  -- UTF-16 is 'f01d4'
         unknown        = '?',
     },
+    -- Exceptional repository state.  Empty strings hide individual markers.
+    repo_state_symbol = {
+        index_lock = 'LOCK',
+        shallow    = 'sh',
+        sparse     = 'sp',
+        worktree   = 'wt',
+        submodule  = 'sub',
+    },
     -- Seconds between full untracked-file scans.  Between full scans, Snapline
     -- uses "git status -uno" and reuses the last untracked count.  Set to 0 to
     -- scan untracked files every time, or false to disable untracked counts.
@@ -156,6 +173,10 @@ local config = {
     -- so the effective cadence is watch_interval at first, later up to 5s.
     watch_repo = true,
     watch_interval = 2.0,
+    -- Preserve high-value Git status on narrow terminals by progressively
+    -- dropping ancillary right-prompt fields instead of losing everything.
+    adaptive_right_prompt = true,
+    right_prompt_min_gap = 4,
     -- Render status glyphs dimmed while an async refresh is pending, so
     -- stale info is visually distinct.  Color is restored when it lands.
     dim_stale_status = true,
@@ -197,6 +218,7 @@ local NESTED_CONFIG = {
     color = true,
     status_format = true,
     action_symbol = true,
+    repo_state_symbol = true,
 }
 local STATUS_FORMAT_SAMPLE = {
     ahead = 1, behind = 1, conflicted = 1, staged = 1, modified = 1,
@@ -320,10 +342,18 @@ end
 local function clear_git_identity_cache()
     _cache.git_dir = nil
     _cache.git_common_dir = nil
+    _cache.git_workspace_dir = nil
+    _cache.git_root = nil
     _cache.git_branch = nil
     _cache.git_action = nil
     _cache.git_action_step = nil
     _cache.git_action_total = nil
+    _cache.git_is_worktree = false
+    _cache.git_is_submodule = false
+    _cache.git_index_locked = false
+    _cache.git_is_shallow = false
+    _cache.git_is_sparse = false
+    _cache.git_state_prompt = ''
     _cache.stash_count = 0
     _cache.stash_prompt = ''
     _cache.fetch_age_prompt = ''
@@ -476,7 +506,12 @@ local function refresh_python_env()
     _cache.python_prompt = config.color.venv .. capsule .. config.color.reset
 end
 
-local function refresh_git_identity_cache(gd)
+local function paths_equal(a, b)
+    if a == b then return true end
+    return type(a) == 'string' and type(b) == 'string' and a:lower() == b:lower()
+end
+
+local function refresh_git_identity_cache(gd, workspace_dir, root)
     if not gd then
         clear_git_identity_cache()
         return
@@ -486,9 +521,14 @@ local function refresh_git_identity_cache(gd)
         clear_git_identity_cache()
     end
     _cache.git_dir = gd
+    _cache.git_workspace_dir = workspace_dir
+    _cache.git_root = root
     if not _cache.git_common_dir then
         _cache.git_common_dir = (git.getcommondir and git.getcommondir()) or gd
     end
+    _cache.git_is_worktree = not paths_equal(_cache.git_common_dir, gd)
+    _cache.git_is_submodule = not _cache.git_is_worktree and
+        workspace_dir ~= nil and not paths_equal(workspace_dir, gd)
     if git.getbranch then
         -- Passing git_dir avoids another upward directory scan.  The fast flag
         -- prevents Clink from spawning synchronous git in reftable repos;
@@ -575,6 +615,42 @@ local function get_file_fingerprint(p, tail_bytes)
     return size .. ':' .. content
 end
 
+local function file_exists(p)
+    return p and os.isfile and os.isfile(p) and true or false
+end
+
+local function refresh_git_state_cache()
+    local gd = _cache.git_dir
+    if not gd then
+        _cache.git_index_locked = false
+        _cache.git_is_shallow = false
+        _cache.git_is_sparse = false
+        _cache.git_state_prompt = ''
+        return
+    end
+
+    local common = _cache.git_common_dir or gd
+    _cache.git_index_locked = file_exists(join_path(gd, 'index.lock'))
+    _cache.git_is_shallow = file_exists(join_path(common, 'shallow'))
+    _cache.git_is_sparse = file_exists(join_path(join_path(gd, 'info'), 'sparse-checkout'))
+
+    local symbols = config.repo_state_symbol
+    local parts = {}
+    if _cache.git_index_locked and symbols.index_lock ~= '' then
+        parts[#parts + 1] = config.color.dirty .. symbols.index_lock .. config.color.reset
+    end
+    local function add_state(active, symbol)
+        if active and symbol ~= '' then
+            parts[#parts + 1] = config.color.state .. symbol .. config.color.reset
+        end
+    end
+    add_state(_cache.git_is_shallow, symbols.shallow)
+    add_state(_cache.git_is_sparse, symbols.sparse)
+    add_state(_cache.git_is_worktree, symbols.worktree)
+    add_state(_cache.git_is_submodule, symbols.submodule)
+    _cache.git_state_prompt = concat(parts, ' ')
+end
+
 local function set_stash_prompt(count)
     count = count or 0
     _cache.stash_count = count
@@ -638,7 +714,10 @@ local function refresh_runtime_cache(at_prompt_boundary)
     local cwd = get_cwd()
     -- Discover repository identity exactly once per prompt boundary.  The
     -- result is reused both for cwd cache carry-over and branch refresh.
-    local gd = (git.getgitdir and git.getgitdir()) or nil
+    local gd, workspace_dir, root
+    if git.getgitdir then
+        gd, workspace_dir, root = git.getgitdir()
+    end
     if cwd ~= _cache.cwd then
         local old = _cache
         _cache = get_init_cache()
@@ -653,10 +732,18 @@ local function refresh_runtime_cache(at_prompt_boundary)
         if gd and gd == old.git_dir then
             _cache.git_dir = gd
             _cache.git_common_dir = old.git_common_dir
+            _cache.git_workspace_dir = workspace_dir or old.git_workspace_dir
+            _cache.git_root = root or old.git_root
             _cache.git_branch = old.git_branch
             _cache.git_action = old.git_action
             _cache.git_action_step = old.git_action_step
             _cache.git_action_total = old.git_action_total
+            _cache.git_is_worktree = old.git_is_worktree
+            _cache.git_is_submodule = old.git_is_submodule
+            _cache.git_index_locked = old.git_index_locked
+            _cache.git_is_shallow = old.git_is_shallow
+            _cache.git_is_sparse = old.git_is_sparse
+            _cache.git_state_prompt = old.git_state_prompt
             _cache.git_upstream_key = old.git_upstream_key
             _cache.git_upstream_prompt = old.git_upstream_prompt
             _cache.git_untracked_at = old.git_untracked_at
@@ -674,8 +761,9 @@ local function refresh_runtime_cache(at_prompt_boundary)
         end
     end
     refresh_python_env()
-    refresh_git_identity_cache(gd)
+    refresh_git_identity_cache(gd, workspace_dir, root)
     refresh_git_action_cache()
+    refresh_git_state_cache()
 end
 
 -- git status via a single porcelain=v2 run
@@ -1246,6 +1334,9 @@ repo_signature = function ()
     local common = _cache.git_common_dir or gd
     local sig = {}
     sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'index'), 64) or '-'
+    sig[#sig + 1] = file_exists(join_path(gd, 'index.lock')) and '1' or '-'
+    sig[#sig + 1] = file_exists(join_path(common, 'shallow')) and '1' or '-'
+    sig[#sig + 1] = file_exists(join_path(join_path(gd, 'info'), 'sparse-checkout')) and '1' or '-'
     sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'HEAD')) or '-'
     sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'MERGE_HEAD')) or '-'
     sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'CHERRY_PICK_HEAD')) or '-'
@@ -1320,6 +1411,7 @@ local function start_repo_watcher()
                 _cache.git_untracked_at = nil
                 _cache.git_status_at = nil
                 refresh_git_action_cache()
+                refresh_git_state_cache()
                 pcall(refresh_fetch_age)
                 start_status_refresh()
                 clink.refilterprompt()
@@ -1356,6 +1448,8 @@ local function git_left_prompt()
         prompt_parts[#prompt_parts+1] = config.color.state .. symbol .. config.color.reset
     end
 
+    append_non_empty(prompt_parts, _cache.git_state_prompt)
+
     return concat(prompt_parts, ' ')
 end
 
@@ -1386,9 +1480,78 @@ local FILTER_PRIORITY = 100  -- lower priority ids are called first
 local pf = clink.promptfilter(FILTER_PRIORITY)
 -- true while an async status refresh is still pending for the shown status
 local git_status_stale = false
+local left_prompt_cells = nil
+
+local function console_number(fn, ...)
+    if not fn then return nil end
+    local ok, value = pcall(fn, ...)
+    return ok and type(value) == 'number' and value or nil
+end
+
+local function render_right_segments(segments)
+    local rendered = ''
+    local has_visible_segment = false
+    for i = 1, #segments do
+        if segments[i].active then
+            if segments[i].zero_width then
+                -- A clean Git status deliberately emits only color controls so
+                -- Clink redraws the async right prompt.  It needs no separator.
+                rendered = rendered .. segments[i].text
+            else
+                if has_visible_segment then rendered = rendered .. ' ' end
+                rendered = rendered .. segments[i].text
+                has_visible_segment = true
+            end
+        end
+    end
+    return rendered
+end
+
+local RIGHT_DROP_ORDER = {
+    'fetch_age',
+    'python',
+    'upstream',
+    'profile_duration',
+    'command_duration',
+    'clock',
+}
+
+local function fit_right_prompt(segments)
+    local rendered = render_right_segments(segments)
+    if not config.adaptive_right_prompt then return rendered end
+
+    local width = console_number(console and console.getwidth)
+    if not width or not left_prompt_cells then return rendered end
+
+    local function fits(text)
+        local cells = console_number(console and console.cellcount, text)
+        return cells and left_prompt_cells + config.right_prompt_min_gap + cells <= width
+    end
+    if fits(rendered) then return rendered end
+
+    for i = 1, #RIGHT_DROP_ORDER do
+        local key = RIGHT_DROP_ORDER[i]
+        for j = 1, #segments do
+            if segments[j].key == key then
+                segments[j].active = false
+                break
+            end
+        end
+        rendered = render_right_segments(segments)
+        if fits(rendered) then return rendered end
+    end
+
+    -- The remaining Git status/stash fields cannot physically coexist with
+    -- the left prompt and safety gap.  Returning empty avoids clipped output.
+    return ''
+end
+
 -- left prompt, first in execution line so it kicks off the async refresh
 function pf:filter()
-    if not snapline_prompt_active then return end
+    if not snapline_prompt_active then
+        left_prompt_cells = nil
+        return
+    end
     -- decide once per input line session; a refilter after an async apply
     -- must not start another refresh or applies would loop forever
     if _cache.git_dir and not session_refresh_started then
@@ -1414,7 +1577,9 @@ function pf:filter()
     append_non_empty(prompt_parts, git_left_prompt())
     append_non_empty(prompt_parts, dir_color..dir_name()..config.color.reset)
     append_non_empty(prompt_parts, errorlevel_prompt_char())
-    return concat(prompt_parts, ' ')
+    local rendered = concat(prompt_parts, ' ')
+    left_prompt_cells = console_number(console and console.cellcount, rendered)
+    return rendered
 end
 -- right filter, second in execution line, renders only cached values
 function pf:rightfilter()
@@ -1438,16 +1603,23 @@ function pf:rightfilter()
     local stash_prompt = _cache.stash_prompt or ''
     local right_prompt_time = config.color.now .. date('%H:%M:%S') .. config.color.reset
 
-    local prompt_parts = {}
-    append_non_empty(prompt_parts, _cache.git_duration)
-    append_non_empty(prompt_parts, git_status_prompt)
-    append_non_empty(prompt_parts, _cache.git_upstream_prompt)
-    append_non_empty(prompt_parts, _cache.fetch_age_prompt)
-    append_non_empty(prompt_parts, stash_prompt)
-    append_non_empty(prompt_parts, _cache.python_prompt)
-    append_non_empty(prompt_parts, fmt_last_cmd_duration())
-    append_non_empty(prompt_parts, right_prompt_time)
-    return concat(prompt_parts, ' ')
+    local command_duration = fmt_last_cmd_duration()
+    local segments = {
+        { key = 'profile_duration', text = _cache.git_duration },
+        { key = 'git_status',       text = git_status_prompt,
+          zero_width = git_status_prompt ~= nil and _cache.git_render_text == '' },
+        { key = 'upstream',         text = _cache.git_upstream_prompt },
+        { key = 'fetch_age',        text = _cache.fetch_age_prompt },
+        { key = 'stash',            text = stash_prompt },
+        { key = 'python',           text = _cache.python_prompt },
+        { key = 'command_duration', text = command_duration },
+        { key = 'clock',            text = right_prompt_time },
+    }
+    for i = 1, #segments do
+        local text = segments[i].text
+        segments[i].active = text ~= nil and text ~= ''
+    end
+    return fit_right_prompt(segments)
 end
 function pf:surround()
     if not snapline_prompt_active then return end
@@ -1514,7 +1686,8 @@ end
 -- print the action and status glyph legend built from the active config, so
 -- it always shows the configured glyphs; typed as the 'snapline-legend' command
 local function run_legend()
-    local fmt, act, col = config.status_format, config.action_symbol, config.color
+    local fmt, act, repo, col = config.status_format, config.action_symbol,
+        config.repo_state_symbol, config.color
 
     -- pad to visible width: nerd glyphs are 3-4 bytes but render as 1-2 cells
     local function pad(s, width)
@@ -1554,6 +1727,11 @@ local function run_legend()
         { 'cherry-picking', act.cherry_picking, 'reverting',    act.reverting },
         { 'bisecting',      act.bisecting,      'unknown',      act.unknown },
         { 'progress',       act.rebase_i .. 'N/M' },
+    })
+    print_rows('repository', col.state, {
+        { 'index lock',     repo.index_lock, 'shallow',     repo.shallow },
+        { 'sparse checkout', repo.sparse,    'linked worktree', repo.worktree },
+        { 'submodule',      repo.submodule },
     })
     print_rows('marks', col.reset, {
         { 'branch',         config.branch_symbol, 'exit code',  config.error_symbol .. 'N' },

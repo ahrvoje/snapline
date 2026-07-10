@@ -23,6 +23,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * virtual environment in yellow
   * git branch
   * git in-progress action; rebase and mail-apply actions include step/total progress when available, e.g. ```Ri3/12```
+  * exceptional repository markers: ```LOCK``` for an index lock, ```sh``` for a shallow clone, ```sp``` for sparse checkout, ```wt``` for a linked worktree, and ```sub``` for a submodule
   * current working directory
     * no-repo in white
     * clean in green
@@ -35,6 +36,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * dim ```~3d``` when the last fetch is older than 3 days (configurable) - ahead/behind may be outdated
   * duration of the last executed command (shown when ≥ 100ms, configurable)
   * current time
+  * width-aware layout: on narrow terminals ancillary fields are removed progressively while Git status and stash state are preserved whenever they fit
 ## git
   * branch
     * clean in green
@@ -66,7 +68,7 @@ Past prompts can collapse to just the exit marker (```> ``` or ```✗1 > ```) wi
 
 ## Configuration
 
-All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, repo watcher, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file. Partial ```color```, ```status_format```, and ```action_symbol``` tables are merged with their defaults. Invalid or unknown options are ignored with a one-time message.
+All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, repo watcher, adaptive right-prompt layout, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file. Partial ```color```, ```status_format```, ```action_symbol```, and ```repo_state_symbol``` tables are merged with their defaults. Invalid or unknown options are ignored with a one-time message.
 
 ## Installation
 
