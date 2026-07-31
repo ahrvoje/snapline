@@ -29,6 +29,9 @@ local function get_init_cache()
         cwd = '',
         venv = nil,
         git_dir = nil,
+        repo_key = nil,
+        repo_generation = 0,
+        identity_invalidated = false,
         git_common_dir = nil,
         git_workspace_dir = nil,
         git_root = nil,
@@ -49,13 +52,13 @@ local function get_init_cache()
         git_untracked_count = 0,
         git_untracked_truncated = false,
         python_prompt = '',
-        pyvenv_cfg_path = nil,
-        pyvenv_version = nil,
+        pyvenv_cache = {},
         stash_count = 0,
         stash_prompt = '',
         fetch_age_prompt = '',
         fetch_age_checked_at = nil,
         repo_signature = nil,
+        repo_observed_signature = nil,
         git_render_text = nil,
         git_status_at = nil,
         git_status_failed = false,
@@ -66,6 +69,7 @@ local function get_init_cache()
     }
 end
 local _cache = get_init_cache()
+local repo_generation = 0
 
 -- No-op outside Clink prompt runtime.
 if not (clink and git and clink.promptfilter and clink.refilterprompt and clink.onbeginedit and clink.onendedit) then
@@ -181,8 +185,8 @@ local config = {
     -- packed-refs, stash log, FETCH_HEAD, ...) and refresh the status when
     -- they change, so commits made from other terminals or editors show up
     -- without pressing Enter.  A probe costs microseconds; git runs only on
-    -- change.  Current Clink versions do not throttle long-lived coroutines by
-    -- default, so watch_interval remains the effective steady-state cadence.
+    -- change.  Short-lived watcher coroutines are rearmed so Clink's long-run
+    -- five-second throttle cannot stretch the configured cadence.
     watch_repo = true,
     watch_interval = 2.0,
     -- Network filesystem metadata calls can block the input thread.  Git
@@ -252,7 +256,7 @@ local function valid_config_value(key, value, default)
         return false
     end
     if type(default) == 'number' then
-        return value >= 0
+        return value >= (key == 'watch_interval' and 0.05 or 0)
     end
     return true
 end
@@ -287,7 +291,8 @@ do
                     end
                 end
             elseif not valid_config_value(key, value, default) then
-                local expected = FALSE_OR_NUMBER[key] and 'a non-negative number or false' or
+                local expected = key == 'watch_interval' and 'a number of at least 0.05 seconds' or
+                    FALSE_OR_NUMBER[key] and 'a non-negative number or false' or
                     (type(default) == 'number' and 'a non-negative number' or type(default))
                 config_warning(format('%s must be %s; override ignored', key, expected))
             else
@@ -315,6 +320,7 @@ local last_start, last_dur_s
 local last_input_blank = false
 local last_input_neutral = false
 local mutation_count = 0
+local record_input
 
 -- append value to table only if it is not nil/empty
 local function append_non_empty(t, s)
@@ -344,9 +350,15 @@ local function maybe_yield()
     end
 end
 
-local function set_pyvenv_cache(path, version)
-    _cache.pyvenv_cfg_path = path
-    _cache.pyvenv_version = version
+local function set_pyvenv_cache(path, version, stamp)
+    local c = _cache.pyvenv_cache
+    c.path, c.version, c.stamp, c.checked_at = path, version, stamp, clock()
+end
+
+local function reset_cache(cwd)
+    local pyvenv = _cache.pyvenv_cache
+    _cache = get_init_cache()
+    _cache.cwd, _cache.pyvenv_cache = cwd or '', pyvenv
 end
 
 local function clear_git_status_cache()
@@ -363,10 +375,14 @@ local function clear_git_status_cache()
     _cache.dirty_branch = nil
     _cache.dirty_dir = nil
     _cache.repo_signature = nil
+    _cache.repo_observed_signature = nil
 end
 
 local function clear_git_identity_cache()
     _cache.git_dir = nil
+    _cache.repo_key = nil
+    _cache.repo_generation = 0
+    _cache.identity_invalidated = false
     _cache.git_common_dir = nil
     _cache.git_workspace_dir = nil
     _cache.git_root = nil
@@ -388,17 +404,22 @@ local function clear_git_identity_cache()
     clear_git_status_cache()
 end
 
-local function set_git_upstream_cache(upstream, branch)
+local function make_upstream_key(upstream, branch)
     upstream = trim(upstream)
-    if not upstream then
+    return upstream and (upstream .. '\0' .. (branch or '')) or nil
+end
+
+local function set_git_upstream_cache(upstream, branch)
+    local key = make_upstream_key(upstream, branch)
+    if not key then
         _cache.git_upstream_key = nil
         _cache.git_upstream_prompt = ''
         return
     end
-    local key = upstream .. '\0' .. (branch or '')
     if key == _cache.git_upstream_key then
         return
     end
+    upstream = trim(upstream)
     local display = upstream
     if config.abbreviate_upstream and branch then
         -- 'origin/main' on branch 'main' is the common case: show just 'origin'
@@ -464,19 +485,19 @@ local function extract_python_version(s)
     return v
 end
 
+local PYVENV_PROBE_INTERVAL = 5.0
 local function get_cached_pyvenv_version(venv_root)
     if not venv_root or #venv_root == 0 then
         set_pyvenv_cache(nil, nil)
         return nil
     end
 
-    -- read pyvenv.cfg only when VIRTUAL_ENV points somewhere new: activation
-    -- always changes the path, and file probes on every prompt would block
-    -- the prompt when the venv lives on a slow network share.  An in-place
-    -- rebuild of the same venv is rare and self-heals on reactivation.
+    -- Recheck the same environment only on a short TTL; this catches in-place
+    -- rebuilds without putting a file read on every prompt boundary.
     local cfg_path = join_path(venv_root, 'pyvenv.cfg')
-    if cfg_path == _cache.pyvenv_cfg_path then
-        return _cache.pyvenv_version
+    local c, now = _cache.pyvenv_cache, clock()
+    if cfg_path == c.path and c.checked_at and now - c.checked_at < PYVENV_PROBE_INTERVAL then
+        return c.version
     end
 
     -- Never let a network-hosted environment stall prompt activation.  The
@@ -495,6 +516,10 @@ local function get_cached_pyvenv_version(venv_root)
     -- prompt cannot allocate an unbounded Lua string.
     local content = f:read(8192)
     f:close()
+    if cfg_path == c.path and content == c.stamp then
+        c.checked_at = now
+        return c.version
+    end
 
     local ver = nil
     if content then
@@ -505,7 +530,7 @@ local function get_cached_pyvenv_version(venv_root)
         ver = extract_python_version(raw)
     end
 
-    set_pyvenv_cache(cfg_path, ver)
+    set_pyvenv_cache(cfg_path, ver, content)
     return ver
 end
 
@@ -554,24 +579,43 @@ local function paths_equal(a, b)
     return type(a) == 'string' and type(b) == 'string' and a:lower() == b:lower()
 end
 
+local function path_key(p)
+    return type(p) == 'string' and p:gsub('[/\\]+', '\\'):gsub('\\+$', ''):lower() or ''
+end
+
+local function make_repo_key(gd, common)
+    return path_key(gd) .. '\0' .. path_key(common or gd)
+end
+
+local function install_repo_identity(gd, common, workspace_dir, root, key)
+    clear_git_identity_cache()
+    repo_generation = repo_generation + 1
+    _cache.repo_key, _cache.repo_generation = key or make_repo_key(gd, common), repo_generation
+    _cache.git_dir, _cache.git_common_dir = gd, common
+    _cache.git_workspace_dir, _cache.git_root = workspace_dir, root
+    _cache.git_is_worktree = not paths_equal(common, gd)
+    _cache.git_is_submodule = not _cache.git_is_worktree and workspace_dir ~= nil and
+        not paths_equal(workspace_dir, gd)
+end
+
 local function refresh_git_identity_cache(gd, workspace_dir, root)
     if not gd then
         clear_git_identity_cache()
         return
     end
 
-    if _cache.git_dir and _cache.git_dir ~= gd then
-        clear_git_identity_cache()
+    local common = (_cache.git_dir and paths_equal(_cache.git_dir, gd) and
+        not _cache.identity_invalidated and _cache.git_common_dir) or
+        ((git.getcommondir and git.getcommondir()) or gd)
+    local key = make_repo_key(gd, common)
+    if _cache.repo_key ~= key then
+        install_repo_identity(gd, common, workspace_dir, root, key)
     end
     _cache.git_dir = gd
+    _cache.identity_invalidated = false
+    _cache.git_common_dir = common
     _cache.git_workspace_dir = workspace_dir
     _cache.git_root = root
-    if not _cache.git_common_dir then
-        _cache.git_common_dir = (git.getcommondir and git.getcommondir()) or gd
-    end
-    _cache.git_is_worktree = not paths_equal(_cache.git_common_dir, gd)
-    _cache.git_is_submodule = not _cache.git_is_worktree and
-        workspace_dir ~= nil and not paths_equal(workspace_dir, gd)
     if git.getbranch then
         -- Passing git_dir avoids another upward directory scan.  The fast flag
         -- prevents Clink from spawning synchronous git in reftable repos;
@@ -767,15 +811,7 @@ local function refresh_runtime_cache(at_prompt_boundary)
     -- than the complete prompt budget.  Prefer a functional local prompt to a
     -- Git-enriched prompt that can freeze input; remote Git is explicit opt-in.
     if not config.enable_remote_repos and is_remote_path(cwd) then
-        if cwd ~= _cache.cwd then
-            local old = _cache
-            _cache = get_init_cache()
-            _cache.cwd = cwd
-            _cache.pyvenv_cfg_path = old.pyvenv_cfg_path
-            _cache.pyvenv_version = old.pyvenv_version
-        else
-            clear_git_identity_cache()
-        end
+        reset_cache(cwd)
         _cache.git_is_remote = true
         refresh_python_env()
         return
@@ -785,7 +821,8 @@ local function refresh_runtime_cache(at_prompt_boundary)
     -- identity/action/state data.  The idle watcher owns external metadata
     -- changes, so repeating synchronous filesystem probes here adds latency
     -- without improving the normal result.
-    if at_prompt_boundary and cwd == _cache.cwd and last_input_neutral and _cache.git_dir then
+    if at_prompt_boundary and cwd == _cache.cwd and last_input_neutral and
+        _cache.git_dir and not _cache.identity_invalidated then
         refresh_python_env()
         return
     end
@@ -795,54 +832,33 @@ local function refresh_runtime_cache(at_prompt_boundary)
     if git.getgitdir then
         gd, workspace_dir, root = git.getgitdir()
     end
+    if not config.enable_remote_repos and gd and is_remote_path(gd) then
+        reset_cache(cwd)
+        _cache.git_is_remote = true
+        refresh_python_env()
+        return
+    end
     if cwd ~= _cache.cwd then
-        local old = _cache
-        _cache = get_init_cache()
-        _cache.cwd = cwd
         slow_status_count = 0
-        -- python env caches are keyed by path, not cwd: carry them over
-        _cache.pyvenv_cfg_path = old.pyvenv_cfg_path
-        _cache.pyvenv_version = old.pyvenv_version
         -- git status is repo-wide (repo-root relative), so it stays valid
-        -- across cd within the same repo: carry it instead of blanking the
-        -- glyphs until the async refresh lands
-        if gd and gd == old.git_dir then
-            _cache.git_dir = gd
-            _cache.git_common_dir = old.git_common_dir
-            _cache.git_workspace_dir = workspace_dir or old.git_workspace_dir
-            _cache.git_root = root or old.git_root
-            _cache.git_branch = old.git_branch
-            _cache.git_action = old.git_action
-            _cache.git_action_step = old.git_action_step
-            _cache.git_action_total = old.git_action_total
-            _cache.git_is_worktree = old.git_is_worktree
-            _cache.git_is_submodule = old.git_is_submodule
-            _cache.git_is_remote = old.git_is_remote
-            _cache.git_index_locked = old.git_index_locked
-            _cache.git_is_shallow = old.git_is_shallow
-            _cache.git_is_sparse = old.git_is_sparse
-            _cache.git_state_prompt = old.git_state_prompt
-            _cache.git_upstream_key = old.git_upstream_key
-            _cache.git_upstream_prompt = old.git_upstream_prompt
-            _cache.git_untracked_at = old.git_untracked_at
-            _cache.git_untracked_count = old.git_untracked_count
-            _cache.git_untracked_truncated = old.git_untracked_truncated
-            _cache.git_render_text = old.git_render_text
-            _cache.git_status_at = old.git_status_at
-            _cache.git_status_failed = old.git_status_failed
-            _cache.git_duration = old.git_duration
-            _cache.dirty_branch = old.dirty_branch
-            _cache.dirty_dir = old.dirty_dir
-            _cache.stash_count = old.stash_count
-            _cache.stash_prompt = old.stash_prompt
-            _cache.fetch_age_prompt = old.fetch_age_prompt
-            _cache.fetch_age_checked_at = old.fetch_age_checked_at
-            _cache.repo_signature = old.repo_signature
+        -- across cd within the same repo.  CWD is runtime state, so retaining
+        -- the cache object preserves every repository field without a fragile
+        -- manual copy list.
+        if gd and _cache.git_dir and paths_equal(gd, _cache.git_dir) then
+            _cache.cwd = cwd
+        else
+            reset_cache(cwd)
         end
     end
     refresh_python_env()
     refresh_git_identity_cache(gd, workspace_dir, root)
-    _cache.git_is_remote = is_remote_path(cwd)
+    _cache.git_is_remote = is_remote_path(cwd) or is_remote_path(_cache.git_dir) or
+        is_remote_path(_cache.git_common_dir)
+    if _cache.git_is_remote and not config.enable_remote_repos then
+        clear_git_identity_cache()
+        _cache.git_is_remote = true
+        return
+    end
     refresh_git_action_cache()
     refresh_git_state_cache()
 end
@@ -1063,11 +1079,17 @@ local function read_status_porcelain(info, scan_untracked)
 end
 
 local function collect_status()
-    local gd = (git.getgitdir and git.getgitdir()) or nil
-    if not gd then return nil end
+    local gd, workspace_dir, root
+    if git.getgitdir then gd, workspace_dir, root = git.getgitdir() end
+    if not gd then return nil, false end
+    local common = (git.getcommondir and git.getcommondir()) or gd
 
     local info = {
         git_dir      = gd,
+        common_dir   = common,
+        workspace_dir = workspace_dir,
+        root         = root,
+        repo_key     = make_repo_key(gd, common),
         branch       = nil,
         upstream     = nil,
         has_ab       = false,
@@ -1089,7 +1111,7 @@ local function collect_status()
 
     local scan_untracked = should_refresh_untracked()
     if not read_status_porcelain(info, scan_untracked) then
-        return nil
+        return nil, gd
     end
 
     if not scan_untracked then
@@ -1101,7 +1123,7 @@ local function collect_status()
     info.dirty_branch = info.conflicted > 0 or info.modified > 0 or info.renamed > 0 or
         info.deleted > 0 or info.staged > 0 or info.tracked > 0 or info.dirty_dir
 
-    return info
+    return info, gd
 end
 
 -- stringify git status info
@@ -1245,7 +1267,7 @@ end
 -- the cached status can be reused without spawning git when the last input
 -- couldn't change git state and the cache is fresh enough
 local function git_status_is_fresh()
-    if not last_input_neutral or _cache.git_status_failed then
+    if not last_input_neutral or _cache.git_status_failed or _cache.git_status_unavailable then
         return false
     end
     local age = config.blank_input_reuse_age
@@ -1314,6 +1336,7 @@ local inflight_count = 0       -- includes abandoned refreshes still finishing
 local refresh_pending = false  -- newest state still needs a collector
 local MAX_INFLIGHT = 2         -- bound Git processes/temp output under churn
 local repo_signature           -- assigned below; called only after script load
+local signature_context
 
 local function prompt_async_enabled()
     local api = rawget(_G, 'settings')
@@ -1322,9 +1345,9 @@ local function prompt_async_enabled()
     return not ok or enabled ~= false
 end
 
-local function try_repo_signature()
+local function try_repo_signature(ctx)
     if not repo_signature then return nil end
-    local ok, signature = pcall(repo_signature)
+    local ok, signature = pcall(repo_signature, ctx)
     return ok and signature or nil
 end
 
@@ -1333,18 +1356,29 @@ local function collect_profile(rec)
     -- duration is always measured since it drives the fsmonitor hint,
     -- config.profile only controls displaying it in the prompt
     local started = clock()
-    -- If disk state changes while status is collecting, retry once rather than
-    -- pairing an old status snapshot with a new watcher baseline.
-    for attempt = 1, 2 do
-        local before = try_repo_signature()
-        response.info = collect_status()
-        local after = try_repo_signature()
-        response.repo_signature = after
-        if not response.info or not before or not after or before == after then
-            break
-        end
+    -- Transactional snapshot: identity changes consume one attempt, and an
+    -- unstable repository consumes another.  Nothing is committed unless a
+    -- final signature still describes the collected status.
+    local ctx = rec.context
+    for attempt = 1, 3 do
+        local before = try_repo_signature(ctx)
+        local info, observed = collect_status()
+        response.info, response.observed_git_dir = info, observed
+        if not info then break end
+        local next_ctx = signature_context(info)
+        next_ctx.repo_key = info.repo_key
+        local identity_changed = next_ctx.repo_key ~= ctx.repo_key
+        local after = try_repo_signature(next_ctx)
+        local same_keys = ctx.branch == next_ctx.branch and
+            ctx.upstream_key == next_ctx.upstream_key
+        local stable = before and after and not identity_changed and
+            before.guard == after.guard and (not same_keys or before.all == after.all)
+        response.context, response.repo_signature = next_ctx, after
+        if stable then break end
         response.info = nil
-        if rec and (rec.abandoned or rec.mutation ~= mutation_count or rec.git_dir ~= _cache.git_dir) then
+        ctx = next_ctx
+        if rec and (rec.abandoned or rec.mutation ~= mutation_count or
+            rec.repo_generation ~= _cache.repo_generation) then
             break
         end
     end
@@ -1356,16 +1390,43 @@ end
 local function apply_status_response(rec, response)
     -- discard when the repo changed or a git-mutating command ran since the
     -- collection started: the data describes a state that no longer exists
-    if rec.mutation ~= mutation_count or rec.git_dir ~= _cache.git_dir then
+    if rec.mutation ~= mutation_count or rec.repo_generation ~= _cache.repo_generation or
+        rec.repo_key ~= _cache.repo_key then
         return false
     end
     local info = response.info
     if not info then
         -- keep the old render but leave it marked stale: it was NOT refreshed
         _cache.git_status_failed = true
+        if response.observed_git_dir == false or
+            (response.observed_git_dir and not paths_equal(response.observed_git_dir, rec.git_dir)) then
+            _cache.identity_invalidated = true
+            _cache.repo_signature = nil
+            _cache.repo_observed_signature = nil
+        end
         return false
     end
+    local ctx, signature = response.context, response.repo_signature
+    local current = ctx and try_repo_signature(ctx)
+    if not ctx or not signature or not current or current.all ~= signature.all then
+        _cache.git_status_failed = true
+        refresh_pending = true
+        return false
+    end
+    if info.repo_key ~= rec.repo_key then
+        if not paths_equal(get_cwd(), rec.cwd) or
+            (not config.enable_remote_repos and
+             (is_remote_path(info.git_dir) or is_remote_path(info.common_dir))) then
+            _cache.identity_invalidated = true
+            return false
+        end
+        install_repo_identity(info.git_dir, info.common_dir, info.workspace_dir, info.root, info.repo_key)
+        refresh_git_action_cache()
+        refresh_git_state_cache()
+    end
     _cache.git_status_failed = false
+    _cache.git_status_unavailable = nil
+    _cache.identity_invalidated = false
     _cache.git_branch    = info.branch or _cache.git_branch
     _cache.dirty_branch  = info.dirty_branch
     _cache.dirty_dir     = info.dirty_dir
@@ -1373,10 +1434,8 @@ local function apply_status_response(rec, response)
     _cache.git_status_at = response.finished_at or clock()
     set_git_upstream_cache(info.upstream, info.branch)
     set_stash_prompt(info.stash_count)
-    -- Branch/upstream discovered by this status add ref paths to the watched
-    -- set, so establish the persisted baseline only after applying them.
-    _cache.repo_signature = try_repo_signature() or
-        response.repo_signature or _cache.repo_signature
+    _cache.repo_signature = signature
+    _cache.repo_observed_signature = signature
     if info.untracked_refreshed then
         _cache.git_untracked_at = response.finished_at or clock()
         _cache.git_untracked_count = info.untracked
@@ -1413,7 +1472,8 @@ start_status_refresh = function ()
     end
     _cache.git_status_unavailable = nil
     if status_inflight then
-        if status_inflight.mutation == mutation_count and status_inflight.git_dir == _cache.git_dir then
+        if status_inflight.mutation == mutation_count and
+            status_inflight.repo_generation == _cache.repo_generation then
             -- a refresh for exactly this state is already collecting
             refresh_pending = false
             return
@@ -1428,10 +1488,19 @@ start_status_refresh = function ()
         return
     end
 
-    local rec = { git_dir = _cache.git_dir, mutation = mutation_count }
+    local rec = {
+        git_dir = _cache.git_dir, repo_key = _cache.repo_key,
+        repo_generation = _cache.repo_generation, mutation = mutation_count,
+        cwd = get_cwd(), context = signature_context(),
+    }
+    rec.context.repo_key = rec.repo_key
     refresh_pending = false
     inflight_count = inflight_count + 1
     rec.co = coroutine.create(function ()
+        if rec.registration_failed then
+            inflight_count = math.max(0, inflight_count - 1)
+            return
+        end
         local ok, response = xpcall(function () return collect_profile(rec) end, traceback_error)
         if status_inflight == rec then
             status_inflight = nil
@@ -1443,10 +1512,12 @@ start_status_refresh = function ()
                     return apply_status_response(rec, response)
                 end, traceback_error)
                 applied = apply_ok and result or false
-                if not apply_ok and rec.mutation == mutation_count and rec.git_dir == _cache.git_dir then
+                if not apply_ok and rec.mutation == mutation_count and
+                    rec.repo_generation == _cache.repo_generation then
                     _cache.git_status_failed = true
                 end
-            elseif rec.mutation == mutation_count and rec.git_dir == _cache.git_dir then
+            elseif rec.mutation == mutation_count and
+                rec.repo_generation == _cache.repo_generation then
                 _cache.git_status_failed = true
             end
             if applied then
@@ -1466,108 +1537,168 @@ start_status_refresh = function ()
     end)
     status_inflight = rec
     -- clink auto-resumes created coroutines while editing is idle
-    if clink.setcoroutinename then clink.setcoroutinename(rec.co, 'snapline status') end
-    if clink.runcoroutineuntilcomplete then clink.runcoroutineuntilcomplete(rec.co) end
+    if clink.setcoroutinename then pcall(clink.setcoroutinename, rec.co, 'snapline status') end
+    if clink.runcoroutineuntilcomplete then
+        local ok = pcall(clink.runcoroutineuntilcomplete, rec.co)
+        if not ok then
+            rec.registration_failed = true
+            status_inflight = nil
+            refresh_pending = false
+            _cache.git_status_failed = true
+            coroutine.resume(rec.co)
+        end
+    end
 end
 
 -- repo watcher: while idle at the prompt, µs-scale file probes detect git
 -- state changed by other terminals/editors and trigger an async refresh, so
 -- the prompt corrects itself without Enter
-repo_signature = function ()
-    local gd = _cache.git_dir
-    if not gd then
-        return nil
+local function pack_signature(parts)
+    for i = 1, #parts do parts[i] = #parts[i] .. ':' .. parts[i] end
+    return concat(parts)
+end
+
+local function sampled_file(p, bytes)
+    return get_file_fingerprint(p, bytes) or '-'
+end
+
+signature_context = function (info)
+    if info then
+        return {
+            git_dir = info.git_dir, common_dir = info.common_dir,
+            root = info.root, branch = info.branch,
+            upstream_key = make_upstream_key(info.upstream, info.branch),
+            repo_key = info.repo_key,
+            remote = is_remote_path(info.git_dir) or is_remote_path(info.common_dir),
+        }
     end
-    local common = _cache.git_common_dir or gd
-    local sig = {}
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'index'), 64) or '-'
-    sig[#sig + 1] = file_exists(join_path(gd, 'index.lock')) and '1' or '-'
-    sig[#sig + 1] = file_exists(join_path(common, 'shallow')) and '1' or '-'
-    sig[#sig + 1] = file_exists(join_path(join_path(gd, 'info'), 'sparse-checkout')) and '1' or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'HEAD')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'MERGE_HEAD')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'CHERRY_PICK_HEAD')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'REVERT_HEAD')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(gd, 'BISECT_LOG'), 128) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(join_path(gd, 'rebase-merge'), 'msgnum')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(join_path(gd, 'rebase-merge'), 'end')) or '-'
-    sig[#sig + 1] = get_file_stamp(join_path(join_path(gd, 'rebase-merge'), 'interactive')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(join_path(gd, 'rebase-apply'), 'next')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(join_path(join_path(gd, 'rebase-apply'), 'last')) or '-'
-    sig[#sig + 1] = get_file_stamp(join_path(join_path(gd, 'rebase-apply'), 'rebasing')) or '-'
-    sig[#sig + 1] = get_file_stamp(join_path(join_path(gd, 'rebase-apply'), 'applying')) or '-'
-    sig[#sig + 1] = get_file_stamp(join_path(common, 'packed-refs')) or '-'
-    sig[#sig + 1] = get_file_stamp(join_path(common, 'FETCH_HEAD')) or '-'
-    sig[#sig + 1] = get_file_fingerprint(
-        join_path(join_path(join_path(common, 'logs'), 'refs'), 'stash'), 256) or '-'
-    sig[#sig + 1] = get_file_fingerprint(
-        join_path(join_path(common, 'reftable'), 'tables.list'), 512) or '-'
-    local branch = _cache.git_branch
+    return {
+        git_dir = _cache.git_dir, common_dir = _cache.git_common_dir,
+        root = _cache.git_root, branch = _cache.git_branch,
+        upstream_key = _cache.git_upstream_key,
+        repo_key = _cache.repo_key, remote = _cache.git_is_remote,
+    }
+end
+
+-- A structured signature gives the watcher both identity and dependency
+-- information.  All reads are bounded; ordinary prompt rendering never calls
+-- this function.
+repo_signature = function (ctx)
+    ctx = ctx or signature_context()
+    local gd = ctx.git_dir
+    if not gd then return nil end
+    if ctx.remote and not config.watch_remote_repo then
+        local key = ctx.repo_key or make_repo_key(gd, ctx.common_dir)
+        return { all = key, guard = key, identity = key, work = key, fetch = key }
+    end
+    local common, dash = ctx.common_dir or gd, '-'
+    local root_dotgit = ctx.root and join_path(ctx.root, '.git')
+    local identity = pack_signature({
+        root_dotgit and not paths_equal(root_dotgit, gd) and sampled_file(root_dotgit, 512) or path_key(gd),
+        not paths_equal(common, gd) and sampled_file(join_path(gd, 'commondir'), 256) or path_key(common),
+    })
+    local config_sig = sampled_file(join_path(common, 'config'), 1024) .. ':' ..
+        sampled_file(join_path(gd, 'config.worktree'), 512)
+    local work = pack_signature({
+        get_file_fingerprint(join_path(gd, 'index'), 64) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'info'), 'sparse-checkout'), 512) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'info'), 'exclude'), 512) or dash,
+        config_sig,
+    })
+    local fetch = sampled_file(join_path(common, 'FETCH_HEAD'), 512)
+    local meta = pack_signature({
+        file_exists(join_path(gd, 'index.lock')) and '1' or dash,
+        file_exists(join_path(common, 'shallow')) and '1' or dash,
+        get_file_fingerprint(join_path(gd, 'HEAD'), 256) or dash,
+        get_file_fingerprint(join_path(gd, 'MERGE_HEAD'), 256) or dash,
+        get_file_fingerprint(join_path(gd, 'CHERRY_PICK_HEAD'), 256) or dash,
+        get_file_fingerprint(join_path(gd, 'REVERT_HEAD'), 256) or dash,
+        get_file_fingerprint(join_path(gd, 'BISECT_LOG'), 128) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'rebase-merge'), 'msgnum'), 64) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'rebase-merge'), 'end'), 64) or dash,
+        get_file_stamp(join_path(join_path(gd, 'rebase-merge'), 'interactive')) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'rebase-apply'), 'next'), 64) or dash,
+        get_file_fingerprint(join_path(join_path(gd, 'rebase-apply'), 'last'), 64) or dash,
+        get_file_stamp(join_path(join_path(gd, 'rebase-apply'), 'rebasing')) or dash,
+        get_file_stamp(join_path(join_path(gd, 'rebase-apply'), 'applying')) or dash,
+        sampled_file(join_path(common, 'packed-refs'), 512), fetch,
+        get_file_fingerprint(join_path(join_path(join_path(common, 'logs'), 'refs'), 'stash'), 256) or dash,
+        get_file_fingerprint(join_path(join_path(common, 'reftable'), 'tables.list'), 512) or dash,
+        config_sig,
+    })
+    local refs, branch, key = {}, ctx.branch, ctx.upstream_key
+    refs[#refs + 1] = branch or dash
     if branch then
-        -- git forbids space, :, ?, *, [, \ and .. in ref names, so the loose
-        -- ref path is safe to probe directly ('/' works in Win32 file APIs)
-        sig[#sig + 1] = get_file_fingerprint(
-            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. branch) or '-'
+        refs[#refs + 1] = get_file_fingerprint(
+            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. branch, 256) or dash
     end
-    -- push moves only the remote-tracking ref, nothing else in .git changes:
-    -- without this probe the ahead count stalls after a push
-    local key = _cache.git_upstream_key
+    refs[#refs + 1] = key or dash
     if key then
         local nul = key:find('\0', 1, true)
         local upstream = nul and key:sub(1, nul - 1) or key
-        sig[#sig + 1] = get_file_fingerprint(
-            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'remotes' .. PATH_SEP .. upstream) or '-'
-        sig[#sig + 1] = get_file_fingerprint(
-            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. upstream) or '-'
+        refs[#refs + 1] = get_file_fingerprint(
+            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'remotes' .. PATH_SEP .. upstream, 256) or dash
+        refs[#refs + 1] = get_file_fingerprint(
+            common .. PATH_SEP .. 'refs' .. PATH_SEP .. 'heads' .. PATH_SEP .. upstream, 256) or dash
     end
-    for i = 1, #sig do
-        sig[i] = #sig[i] .. ':' .. sig[i]
-    end
-    return concat(sig)
+    refs = pack_signature(refs)
+    local guard = pack_signature({ identity, work, meta })
+    return { all = pack_signature({ guard, refs }), guard = guard,
+        identity = identity, work = work, fetch = fetch }
 end
 
-local function start_repo_watcher()
-    if not config.watch_repo or watcher_started or not _cache.git_dir or
+local start_repo_watcher
+local function arm_repo_watcher(generation)
+    local co = coroutine.create(function ()
+        coroutine.yield()
+        if generation ~= _cache.repo_generation then
+            watcher_started = false
+            start_repo_watcher()
+            return
+        end
+        local ok, sig = pcall(repo_signature)
+        local base = _cache.repo_observed_signature or _cache.repo_signature
+        if ok and sig then
+            if base and sig.all ~= base.all then
+                _cache.repo_observed_signature = sig
+                mutation_count = mutation_count + 1
+                if sig.identity ~= base.identity then _cache.identity_invalidated = true end
+                if sig.work ~= base.work then _cache.git_untracked_at = nil end
+                _cache.git_status_at = nil
+                refresh_git_action_cache()
+                refresh_git_state_cache()
+                if sig.fetch ~= base.fetch then pcall(refresh_fetch_age, true) end
+                start_status_refresh()
+                pcall(clink.refilterprompt)
+            elseif not base then
+                _cache.repo_observed_signature = sig
+            end
+        end
+        -- Rearming a short-lived coroutine avoids Clink's five-second
+        -- throttling of long-lived sub-five-second watchers.
+        if generation == _cache.repo_generation and watcher_started then
+            arm_repo_watcher(generation)
+        end
+    end)
+    -- Prime to the timer yield now; the first scheduled resume performs one
+    -- probe, so each short-lived watcher has exactly one interval of delay.
+    coroutine.resume(co)
+    if clink.setcoroutinename then pcall(clink.setcoroutinename, co, 'snapline watch') end
+    if clink.setcoroutineinterval and
+        not pcall(clink.setcoroutineinterval, co, config.watch_interval) then
+        watcher_started = false
+    end
+end
+
+start_repo_watcher = function ()
+    if not config.watch_repo or not clink.setcoroutineinterval or watcher_started or not _cache.git_dir or
         (_cache.git_is_remote and not config.watch_remote_repo) then
         return
     end
     watcher_started = true
     -- created without runcoroutineuntilcomplete: clink cancels it when the
     -- edit session ends, and the next session's filter starts a fresh one
-    local co = coroutine.create(function ()
-        local base = _cache.repo_signature
-        while true do
-            coroutine.yield()
-            local ok, sig = pcall(repo_signature)
-            if not ok or not sig then
-                break
-            end
-            if base == nil then
-                -- A status coroutine may have completed since this watcher was
-                -- created.  Prefer its post-status signature so changes in the
-                -- former blind window are not adopted as a new baseline.
-                base = _cache.repo_signature or sig
-            end
-            if sig ~= base then
-                base = sig
-                _cache.repo_signature = sig
-                -- a status still collecting started before this on-disk
-                -- change, so its data is already outdated: counting the
-                -- change as a mutation makes start_status_refresh abandon
-                -- it and collect anew instead of deduplicating against it
-                mutation_count = mutation_count + 1
-                _cache.git_untracked_at = nil
-                _cache.git_status_at = nil
-                refresh_git_action_cache()
-                refresh_git_state_cache()
-                pcall(refresh_fetch_age, true)
-                start_status_refresh()
-                clink.refilterprompt()
-            end
-        end
-    end)
-    if clink.setcoroutinename then clink.setcoroutinename(co, 'snapline watch') end
-    if clink.setcoroutineinterval then clink.setcoroutineinterval(co, config.watch_interval) end
+    arm_repo_watcher(_cache.repo_generation)
 end
 
 local function git_left_prompt()
@@ -1709,7 +1840,7 @@ function pf:filter()
     if _cache.git_dir and not session_refresh_started then
         session_refresh_started = true
         -- spawn git only when the cached status isn't provably fresh
-        if not git_status_is_fresh() then
+        if not prompt_async_enabled() or not git_status_is_fresh() then
             start_status_refresh()
         end
     end
@@ -1894,6 +2025,7 @@ local function run_legend()
 end
 
 local function command_input_filter(text)
+    if record_input then record_input(text) end
     if text and text:match('^%s*snapline%-bench%s*$') then
         run_bench()
         return '', false
@@ -1913,7 +2045,7 @@ local function on_beginedit_timing()
     end
 end
 
-local function on_endedit(line)
+record_input = function (line)
     last_input_blank = not (line and line:find('%S'))
     last_input_neutral = last_input_blank or is_status_neutral_input(line or '')
     if not last_input_neutral then
@@ -1925,15 +2057,18 @@ local function on_endedit(line)
         _cache.git_status_at = nil
         _cache.fetch_age_checked_at = nil
     end
+end
+
+local function on_endedit(line)
+    -- onfilterinput sees text after earlier input filters.  Older Clink builds
+    -- without that event fall back to the original onendedit text.
+    if not clink.onfilterinput then record_input(line) end
     last_start = clock()
 end
 
 local function on_beginedit_refresh_runtime_cache()
     refresh_runtime_cache(true)
 end
-
-refresh_runtime_cache(false)
-refresh_fetch_age()
 
 clink.onbeginedit(on_beginedit_timing)
 clink.onbeginedit(on_beginedit_refresh_runtime_cache)

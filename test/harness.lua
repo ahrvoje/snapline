@@ -72,7 +72,8 @@ local G = {}  -- git repo state
 local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
             raise = false, stash_count = 2, config_value = '',
             errorlevel = 0, aliases = {}, env = {}, async = true,
-            remote = false, clock_step = 0 }
+            remote = false, remote_path = nil, clock_step = 0,
+            registration_fail = false, status_eof = false, clock_hook = nil }
 local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
@@ -90,7 +91,10 @@ local function make_clink_stub()
         onendedit = function (f) H.endedit[#H.endedit + 1] = f end,
         onfilterinput = function (f) H.filterinput[#H.filterinput + 1] = f end,
         refilterprompt = function () H.refilters = H.refilters + 1 end,
-        runcoroutineuntilcomplete = function (co) H.keep[co] = true end,
+        runcoroutineuntilcomplete = function (co)
+            if P.registration_fail then error('simulated coroutine registration failure') end
+            H.keep[co] = true
+        end,
         setcoroutineinterval = function () end,
         setcoroutinename = function () end,
         getclinkprompt = function () return H.active_prompt end,
@@ -118,6 +122,7 @@ end
 local function make_git_stub()
     return {
         getgitdir = function ()
+            G.gitdir_calls = (G.gitdir_calls or 0) + 1
             return G.gitdir, G.workspace_dir or G.gitdir, G.root or CWD.path
         end,
         getcommondir = function () return G.commondir or G.gitdir end,
@@ -166,7 +171,10 @@ io.popenyield = function (cmd)
                 coroutine.yield()
             end
             if mode == '*l' then
-                if pos > #out then return nil end
+                if pos > #out then
+                    if cmd:find('status --porcelain', 1, true) then P.status_eof = true end
+                    return nil
+                end
                 local nl = out:find('\n', pos, true)
                 local line
                 if nl then
@@ -193,10 +201,18 @@ os.getalias = function (name)
         if P.aliases[i]:lower() == name:lower() then return 'replacement' end
     end
 end
-os.getdrivetype = function () return P.remote and 'remote' or 'fixed' end
+os.getdrivetype = function (path)
+    return (P.remote or (P.remote_path and path and
+        path:lower():find(P.remote_path:lower(), 1, true))) and 'remote' or 'fixed'
+end
 os.clock = function ()
     local value = NOW
     NOW = NOW + P.clock_step
+    if P.status_eof and P.clock_hook then
+        local hook = P.clock_hook
+        P.clock_hook, P.status_eof = nil, false
+        hook()
+    end
     return value
 end
 
@@ -207,11 +223,11 @@ end
 
 local function endedit(line)
     for i = 1, #H.endedit do H.endedit[i](line) end
-    local replaced
+    local replaced, filtered = nil, line
     H.filter_stopped = false
     for i = 1, #H.filterinput do
-        local r, continue = H.filterinput[i](line)
-        if r ~= nil then replaced = r end
+        local r, continue = H.filterinput[i](filtered)
+        if r ~= nil then replaced, filtered = r, r end
         if continue == false then
             H.filter_stopped = true
             break
@@ -258,10 +274,12 @@ local function load_snapline(overrides)
     G.workspace_dir, G.root = nil, nil
     G.action_step, G.action_total = nil, nil
     G.branch_git_dir, G.branch_fast = nil, nil
+    G.gitdir_calls = 0
     P.calls, P.lastcmd, P.porcelain = 0, '', ''
     P.fail, P.slow, P.raise, P.stash_count = false, false, false, 2
     P.config_value, P.errorlevel, P.aliases, P.env = '', 0, {}, {}
-    P.async, P.remote, P.clock_step = true, false, 0
+    P.async, P.remote, P.remote_path, P.clock_step = true, false, nil, 0
+    P.registration_fail, P.status_eof, P.clock_hook = false, false, nil
     CWD.path = 'C:\\work\\proj'
     NOW = 1000
     dofile(SNAPLINE)
@@ -378,12 +396,15 @@ check(pright:find('origin', 1, true) ~= nil and pright:find('origin/main', 1, tr
 
 -- T3 blank Enter reuse
 G.action, G.action_step, G.action_total = nil, nil, nil
+local cached_identity_calls = G.gitdir_calls
 endedit('')
 beginedit()
 H.pf:filter()
 right = H.pf:rightfilter()
 tick()
 check(P.calls == 1, 'blank Enter reused status without spawning git')
+check(G.gitdir_calls == cached_identity_calls,
+    'blank Enter reused repository identity without a synchronous discovery probe')
 check(color_at(right, '⇕⇡1⇣2') == DIRTY_SGR, 'reused status rendered undimmed')
 
 -- T4 neutral command reuse
@@ -549,6 +570,8 @@ tick()
 check(H.refilters == ref1 + 3, 'watcher detected remote-tracking ref update (push)')
 tick()
 check(P.calls == calls0 + 2, 'push-triggered status ran')
+check(P.lastcmd:find('--untracked-files=no', 1, true) ~= nil,
+    'ref-only watcher change preserves throttled untracked cache')
 right = H.pf:rightfilter()
 pright = plain(right)
 check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
@@ -863,6 +886,113 @@ P.remote = true
 beginedit(); left = H.pf:filter(); tick()
 check(P.calls == 0 and plain(left):find('main', 1, true) == nil,
     'remote repositories are skipped by default to preserve bounded prompt latency')
+
+-- =====================================================================
+print('===== suite 8: semantic cache lifecycle =====')
+load_snapline({ watch_repo = false })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_DIRTY
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+local transactional_calls = P.calls
+P.porcelain = PORC_STAGED
+endedit('git add transactional')
+beginedit(); H.pf:filter()
+P.status_eof = false
+P.clock_hook = function ()
+    local f = assert(io.open(REPO_GD .. '\\index', 'ab'))
+    f:write('t'); f:close()
+end
+tick()  -- post-status mutation rejects the first result and queues a retry
+check(P.calls == transactional_calls + 1,
+    'post-collection mutation rejects the first collected result')
+tick(); H.pf:filter()
+check(P.calls == transactional_calls + 2 and
+      plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
+    'transaction rejection automatically retries and applies a stable snapshot')
+
+load_snapline({ watch_repo = false, blank_input_reuse_age = 1 })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_DIRTY
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+local PORC_OTHER = PORC_CLEAN:gsub('branch.head main', 'branch.head other')
+G.gitdir, G.branch, G.commondir = REPO_GD .. '\\replacement', 'other', nil
+P.porcelain = PORC_OTHER
+NOW = NOW + 2
+endedit(''); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(plain(H.pf:filter()):find('other', 1, true) ~= nil,
+    'same-CWD repository replacement atomically adopts the new identity')
+
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_STAGED
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+P.async = false
+endedit(''); beginedit(); H.pf:filter()
+check(plain(H.pf:rightfilter()):find('async-off', 1, true) ~= nil,
+    'async disable invalidates a still-fresh status presentation')
+local toggle_calls = P.calls
+P.async = true
+endedit(''); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == toggle_calls + 1 and
+      plain(H.pf:rightfilter()):find('async-off', 1, true) == nil,
+    'async re-enable immediately refreshes and clears unavailable state')
+
+load_snapline(nil)
+G.gitdir, G.branch = 'Z:\\remote-repo\\.git', 'main'
+P.remote_path = 'Z:'
+beginedit(); left = H.pf:filter(); tick()
+check(P.calls == 0 and plain(left):find('main', 1, true) == nil,
+    'remote Git metadata is skipped even when the working directory is local')
+
+load_snapline({ enable_remote_repos = true })
+G.gitdir, G.branch = 'Z:\\remote-repo\\.git', 'main'
+P.remote_path, P.porcelain = 'Z:', PORC_STAGED
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == 1 and plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
+    'remote opt-in keeps status async without remote watcher probes')
+
+load_snapline({ watch_repo = false })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain, P.registration_fail = PORC_STAGED, true
+beginedit(); H.pf:filter(); tick()
+check(P.calls == 0, 'coroutine registration failure starts no blocking status work')
+P.registration_fail = false
+endedit(''); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == 1 and plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
+    'scheduler bookkeeping rolls back and recovers after registration failure')
+
+load_snapline({ watch_interval = 0 })
+beginedit()
+check(table.concat(H.printed, '\n'):find('watch_interval', 1, true) ~= nil,
+    'zero watcher interval is rejected instead of creating a hot loop')
+
+local VENV = HERE .. 'fakevenv'
+os.execute('cmd /c mkdir "' .. VENV .. '" 2>nul')
+write_fixture(VENV .. '\\pyvenv.cfg', 'version = 3.11.0\n')
+load_snapline(nil)
+P.env.VIRTUAL_ENV = VENV
+beginedit(); H.pf:filter()
+check(plain(H.pf:rightfilter()):find('py3.11:venv', 1, true) ~= nil,
+    'python environment version initializes from bounded config content')
+write_fixture(VENV .. '\\pyvenv.cfg', 'version = 3.12.0\n')
+NOW = NOW + 6
+endedit(''); beginedit(); H.pf:filter()
+check(plain(H.pf:rightfilter()):find('py3.12:venv', 1, true) ~= nil,
+    'same-path virtual environment rebuild invalidates after the short TTL')
+os.remove(VENV .. '\\pyvenv.cfg')
+os.remove(VENV)
+
+load_snapline({ watch_repo = false })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_STAGED
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+table.insert(H.filterinput, 1, function (line)
+    return line == 'dir' and 'git add rewritten' or nil
+end)
+local rewritten_calls = P.calls
+endedit('dir'); beginedit(); H.pf:filter(); tick()
+check(P.calls == rewritten_calls + 1,
+    'cache invalidation classifies text rewritten by earlier input filters')
 
 print('')
 print(string.format('%d tests, %d failures', tests, fails))

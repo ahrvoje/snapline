@@ -6,15 +6,16 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Uses a cached sub-millisecond render path; Git runs only when Clink asynchronous prompts are enabled.
   * Streams and time-slices status parsing to a ~1ms budget so huge outputs cannot monopolize the input thread.
   * Bounds status parsing at 100,000 changed paths by default and coalesces obsolete refreshes to at most two status processes.
+  * Applies status transactionally: repository generations and before/after metadata signatures prevent stale or cross-repository results from entering the cache.
   * Refuses to fall back to blocking Git when ```prompt.async=false``` (the prompt shows ```async-off```).
-  * Skips Git integration on remote/UNC drives by default because filesystem metadata calls can block unpredictably.
+  * Skips Git integration when either the working directory or Git metadata is remote/UNC because filesystem calls can block unpredictably.
   * Cache last results so the content is always & instantly present.
   * Implement alternative methods proven to run much faster.
   * Blank Enter reuses the last git status - no git process is spawned at all.
   * Status-neutral commands (```cls```, ```dir```, ```type```, ```git log```, ```git diff```, ... with no redirection) also reuse the last status - most prompts spawn nothing.
-  * ```cd``` within the same repo carries the status over - git status is repo-wide, so no blank flash and no extra git run.
+  * ```cd``` within the same repo retains the repository cache object - no field copying, blank flash, or extra git run.
   * Async status survives Enter: on a slow repo the refresh lands on a later prompt instead of being canceled and restarted by every command.
-  * Idle metadata watcher notices commits/ref updates made from other terminals (including reftable repositories) and refreshes the prompt by itself - no Enter needed. It deliberately does not scan the working tree.
+  * A short-lived idle metadata watcher notices identity/config/action/ref updates (including reftable repositories) without Clink stretching its cadence. Ref-only changes reuse the throttled untracked count. It deliberately does not scan the working tree.
   * Async status runs with ```--no-optional-locks``` so it never takes ```index.lock``` and never collides with git commands typed at the prompt.
   * Stash count is collected by the existing async porcelain status process; no synchronous stash probe or extra process is needed.
   * One-time hint to enable ```core.fsmonitor``` when git status is repeatedly slow.
