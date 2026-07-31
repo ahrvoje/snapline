@@ -3,15 +3,18 @@
 Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rendering Git status while focusing on speed and concise info using caching and async techniques to ensure snappiness at all times.
 
 ## Speed
-  * Using only sub-millisecond calls to build the prompt - git only ever runs async.
-  * Async all delays so editing is never blocked.
+  * Uses a cached sub-millisecond render path; Git runs only when Clink asynchronous prompts are enabled.
+  * Streams and time-slices status parsing to a ~1ms budget so huge outputs cannot monopolize the input thread.
+  * Bounds status parsing at 100,000 changed paths by default and coalesces obsolete refreshes to at most two status processes.
+  * Refuses to fall back to blocking Git when ```prompt.async=false``` (the prompt shows ```async-off```).
+  * Skips Git integration on remote/UNC drives by default because filesystem metadata calls can block unpredictably.
   * Cache last results so the content is always & instantly present.
   * Implement alternative methods proven to run much faster.
   * Blank Enter reuses the last git status - no git process is spawned at all.
   * Status-neutral commands (```cls```, ```dir```, ```type```, ```git log```, ```git diff```, ... with no redirection) also reuse the last status - most prompts spawn nothing.
   * ```cd``` within the same repo carries the status over - git status is repo-wide, so no blank flash and no extra git run.
   * Async status survives Enter: on a slow repo the refresh lands on a later prompt instead of being canceled and restarted by every command.
-  * Idle repo watcher notices commits made from other terminals/editors (µs-scale content fingerprints, including reftable repositories) and refreshes the prompt by itself - no Enter needed.
+  * Idle metadata watcher notices commits/ref updates made from other terminals (including reftable repositories) and refreshes the prompt by itself - no Enter needed. It deliberately does not scan the working tree.
   * Async status runs with ```--no-optional-locks``` so it never takes ```index.lock``` and never collides with git commands typed at the prompt.
   * Stash count is collected by the existing async porcelain status process; no synchronous stash probe or extra process is needed.
   * One-time hint to enable ```core.fsmonitor``` when git status is repeatedly slow.
@@ -34,9 +37,9 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * ```⇡?``` when an upstream is configured but ahead/behind is unknown (upstream gone, or ```ahead_behind=false```)
   * git upstream, abbreviated to the remote name when it matches the current branch
   * dim ```~3d``` when the last fetch is older than 3 days (configurable) - ahead/behind may be outdated
-  * duration of the last executed command (shown when ≥ 100ms, configurable)
+  * duration of every submitted line, including an exact zero as ```0ms```
   * current time
-  * width-aware layout: on narrow terminals ancillary fields are removed progressively while Git status and stash state are preserved whenever they fit
+  * width-aware layout: ancillary fields are removed progressively; command duration has highest retention priority, followed by Git/stash state when space permits
 ## git
   * branch
     * clean in green
@@ -68,7 +71,7 @@ Past prompts can collapse to just the exit marker (```> ``` or ```✗1 > ```) wi
 
 ## Configuration
 
-All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, repo watcher, adaptive right-prompt layout, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file. Partial ```color```, ```status_format```, ```action_symbol```, and ```repo_state_symbol``` tables are merged with their defaults. Invalid or unknown options are ignored with a one-time message.
+All knobs live in the ```config``` table at the top of ```snapline.lua``` (reuse window, untracked scan interval, status entry bound, local/remote repository policy, repo watcher, adaptive right-prompt layout, ahead/behind counts, fetch age, duration threshold, colors, glyphs, ...). A wrapper script loaded before snapline can also define a global ```snapline_config``` table to override entries without editing the file. Partial ```color```, ```status_format```, ```action_symbol```, and ```repo_state_symbol``` tables are merged with their defaults. Invalid or unknown options are ignored with a one-time message.
 
 ## Installation
 

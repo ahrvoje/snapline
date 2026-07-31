@@ -5,6 +5,8 @@
 --            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??'     stashed=' ≡N'  renamed=' »N'
 --          '⇡?' upstream set but ahead/behind unknown (upstream gone or ahead_behind=false)
 --          '…' first status for this repo is still collecting     '~Nd' time since last fetch
+--          '≥N' status entry limit reached (shown counts are lower bounds)
+--          'async-off' Clink prompt.async is disabled, so blocking Git is suppressed
 -- In-progress git state indicator (yellow unicode char): rebase/am/merge/cherry-pick/revert/bisect;
 -- rebase/am operations include progress when Git exposes it, e.g. Ri3/12.
 -- Repository markers: LOCK=index lock, sh=shallow, sp=sparse, wt=linked worktree, sub=submodule.
@@ -36,6 +38,7 @@ local function get_init_cache()
         git_action_total = nil,
         git_is_worktree = false,
         git_is_submodule = false,
+        git_is_remote = false,
         git_index_locked = false,
         git_is_shallow = false,
         git_is_sparse = false,
@@ -44,16 +47,19 @@ local function get_init_cache()
         git_upstream_prompt = '',
         git_untracked_at = nil,
         git_untracked_count = 0,
+        git_untracked_truncated = false,
         python_prompt = '',
         pyvenv_cfg_path = nil,
         pyvenv_version = nil,
         stash_count = 0,
         stash_prompt = '',
         fetch_age_prompt = '',
+        fetch_age_checked_at = nil,
         repo_signature = nil,
         git_render_text = nil,
         git_status_at = nil,
         git_status_failed = false,
+        git_status_unavailable = nil,
         git_duration = '',
         dirty_branch = nil,
         dirty_dir = nil,
@@ -108,6 +114,8 @@ local config = {
         behind     = '⇣%d',
         ab_unknown = '⇡?',   -- upstream configured but counts unknown (gone or ahead_behind=false)
         pending    = '…',    -- shown while the first status for a repo is still collecting
+        truncated  = '≥%d',  -- status entry limit reached; counts are lower bounds
+        async_off  = 'async-off', -- prompt.async=false: never block by falling back to io.popen
         fetch_age  = '~%s',  -- time since last fetch, e.g. '~3d'
         conflicted = '\243\177\144\139%d',  -- UTF-8 code for thunder glyph, UTF-16 is 'f140b'
         staged     = '+%d',
@@ -148,6 +156,10 @@ local config = {
     -- uses "git status -uno" and reuses the last untracked count.  Set to 0 to
     -- scan untracked files every time, or false to disable untracked counts.
     untracked_refresh_interval = 2.0,
+    -- Bound parsing work for pathological repositories.  Counts become lower
+    -- bounds and the truncated marker is shown after this many changed paths.
+    -- Set 0 or false to parse every entry (not recommended for interactive use).
+    status_entry_limit = 100000,
     -- False ignores dirt inside submodule worktrees but still reports when a
     -- submodule HEAD differs from the commit recorded by the superproject.
     status_include_submodules = false,
@@ -169,10 +181,15 @@ local config = {
     -- packed-refs, stash log, FETCH_HEAD, ...) and refresh the status when
     -- they change, so commits made from other terminals or editors show up
     -- without pressing Enter.  A probe costs microseconds; git runs only on
-    -- change.  Clink throttles long-lived coroutines to one resume per 5s,
-    -- so the effective cadence is watch_interval at first, later up to 5s.
+    -- change.  Current Clink versions do not throttle long-lived coroutines by
+    -- default, so watch_interval remains the effective steady-state cadence.
     watch_repo = true,
     watch_interval = 2.0,
+    -- Network filesystem metadata calls can block the input thread.  Git
+    -- integration is therefore local-only by default; opt in explicitly when
+    -- status fidelity on UNC/mapped network drives is worth the latency risk.
+    enable_remote_repos = false,
+    watch_remote_repo = false,
     -- Preserve high-value Git status on narrow terminals by progressively
     -- dropping ancillary right-prompt fields instead of losing everything.
     adaptive_right_prompt = true,
@@ -191,8 +208,8 @@ local config = {
     -- this many seconds - a reminder that ahead/behind counts may be
     -- outdated.  Set false to disable.
     fetch_age_min = 259200,  -- 3 days
-    -- Hide last-command durations below this many seconds.  Set 0 to show all.
-    -- Default 0.0 shows all durations.
+    -- Hide last-command durations below this many seconds.  Default 0 shows
+    -- every submitted line, including an exact zero as '0ms'.
     min_duration_display = 0.0,
     -- Print a one-time hint when git status is repeatedly slow and
     -- core.fsmonitor is not enabled for the repo.
@@ -212,6 +229,7 @@ end
 
 local FALSE_OR_NUMBER = {
     untracked_refresh_interval = true,
+    status_entry_limit = true,
     fetch_age_min = true,
 }
 local NESTED_CONFIG = {
@@ -223,7 +241,7 @@ local NESTED_CONFIG = {
 local STATUS_FORMAT_SAMPLE = {
     ahead = 1, behind = 1, conflicted = 1, staged = 1, modified = 1,
     renamed = 1, deleted = 1, tracked = 1, untracked = 1, stashed = 1,
-    fetch_age = '1d',
+    fetch_age = '1d', truncated = 1,
 }
 
 local function valid_config_value(key, value, default)
@@ -291,6 +309,12 @@ local watcher_started = false
 -- the prompt filter decides once per input line session whether to refresh;
 -- refilters after an async apply must not start another round
 local session_refresh_started = false
+-- command lifecycle state is declared before cache refresh helpers so prompt-
+-- boundary fast paths never fall through to an accidental global.
+local last_start, last_dur_s
+local last_input_blank = false
+local last_input_neutral = false
+local mutation_count = 0
 
 -- append value to table only if it is not nil/empty
 local function append_non_empty(t, s)
@@ -330,9 +354,11 @@ local function clear_git_status_cache()
     _cache.git_upstream_prompt = ''
     _cache.git_untracked_at = nil
     _cache.git_untracked_count = 0
+    _cache.git_untracked_truncated = false
     _cache.git_render_text = nil
     _cache.git_status_at = nil
     _cache.git_status_failed = false
+    _cache.git_status_unavailable = nil
     _cache.git_duration = ''
     _cache.dirty_branch = nil
     _cache.dirty_dir = nil
@@ -350,6 +376,7 @@ local function clear_git_identity_cache()
     _cache.git_action_total = nil
     _cache.git_is_worktree = false
     _cache.git_is_submodule = false
+    _cache.git_is_remote = false
     _cache.git_index_locked = false
     _cache.git_is_shallow = false
     _cache.git_is_sparse = false
@@ -357,6 +384,7 @@ local function clear_git_identity_cache()
     _cache.stash_count = 0
     _cache.stash_prompt = ''
     _cache.fetch_age_prompt = ''
+    _cache.fetch_age_checked_at = nil
     clear_git_status_cache()
 end
 
@@ -415,6 +443,12 @@ local function join_path(a, b)
     return a .. PATH_SEP .. b
 end
 
+local function is_remote_path(p)
+    if not (p and os.getdrivetype) then return false end
+    local ok, drive_type = pcall(os.getdrivetype, p)
+    return ok and drive_type == 'remote'
+end
+
 local function extract_python_version(s)
     if not s or #s == 0 then
         return nil
@@ -445,12 +479,21 @@ local function get_cached_pyvenv_version(venv_root)
         return _cache.pyvenv_version
     end
 
+    -- Never let a network-hosted environment stall prompt activation.  The
+    -- version can still come from PYTHON_VERSION/UV_PYTHON below.
+    if is_remote_path(venv_root) then
+        set_pyvenv_cache(cfg_path, nil)
+        return nil
+    end
+
     local f = io.open(cfg_path, 'rb')
     if not f then
         set_pyvenv_cache(cfg_path, nil)
         return nil
     end
-    local content = f:read('*a')
+    -- pyvenv.cfg is tiny by definition; cap a corrupt/adversarial file so a
+    -- prompt cannot allocate an unbounded Lua string.
+    local content = f:read(8192)
     f:close()
 
     local ver = nil
@@ -670,7 +713,14 @@ local snapline_prompt_active = true
 
 -- dim '~3d' reminder that ahead/behind may be outdated when the last fetch
 -- (FETCH_HEAD mtime) is older than config.fetch_age_min
-local function refresh_fetch_age()
+local FETCH_AGE_PROBE_INTERVAL = 60.0
+local function refresh_fetch_age(force)
+    local now = clock()
+    if not force and _cache.fetch_age_checked_at and
+        now - _cache.fetch_age_checked_at < FETCH_AGE_PROBE_INTERVAL then
+        return
+    end
+    _cache.fetch_age_checked_at = now
     _cache.fetch_age_prompt = ''
     if not snapline_prompt_active then return end
     local min_age = config.fetch_age_min
@@ -712,6 +762,33 @@ local function refresh_runtime_cache(at_prompt_boundary)
     watcher_started = false
     session_refresh_started = false
     local cwd = get_cwd()
+
+    -- A single metadata lookup on a disconnected UNC path can take far longer
+    -- than the complete prompt budget.  Prefer a functional local prompt to a
+    -- Git-enriched prompt that can freeze input; remote Git is explicit opt-in.
+    if not config.enable_remote_repos and is_remote_path(cwd) then
+        if cwd ~= _cache.cwd then
+            local old = _cache
+            _cache = get_init_cache()
+            _cache.cwd = cwd
+            _cache.pyvenv_cfg_path = old.pyvenv_cfg_path
+            _cache.pyvenv_version = old.pyvenv_version
+        else
+            clear_git_identity_cache()
+        end
+        _cache.git_is_remote = true
+        refresh_python_env()
+        return
+    end
+
+    -- Blank/read-only commands in an unchanged repository can reuse all
+    -- identity/action/state data.  The idle watcher owns external metadata
+    -- changes, so repeating synchronous filesystem probes here adds latency
+    -- without improving the normal result.
+    if at_prompt_boundary and cwd == _cache.cwd and last_input_neutral and _cache.git_dir then
+        refresh_python_env()
+        return
+    end
     -- Discover repository identity exactly once per prompt boundary.  The
     -- result is reused both for cwd cache carry-over and branch refresh.
     local gd, workspace_dir, root
@@ -740,6 +817,7 @@ local function refresh_runtime_cache(at_prompt_boundary)
             _cache.git_action_total = old.git_action_total
             _cache.git_is_worktree = old.git_is_worktree
             _cache.git_is_submodule = old.git_is_submodule
+            _cache.git_is_remote = old.git_is_remote
             _cache.git_index_locked = old.git_index_locked
             _cache.git_is_shallow = old.git_is_shallow
             _cache.git_is_sparse = old.git_is_sparse
@@ -748,6 +826,7 @@ local function refresh_runtime_cache(at_prompt_boundary)
             _cache.git_upstream_prompt = old.git_upstream_prompt
             _cache.git_untracked_at = old.git_untracked_at
             _cache.git_untracked_count = old.git_untracked_count
+            _cache.git_untracked_truncated = old.git_untracked_truncated
             _cache.git_render_text = old.git_render_text
             _cache.git_status_at = old.git_status_at
             _cache.git_status_failed = old.git_status_failed
@@ -757,11 +836,13 @@ local function refresh_runtime_cache(at_prompt_boundary)
             _cache.stash_count = old.stash_count
             _cache.stash_prompt = old.stash_prompt
             _cache.fetch_age_prompt = old.fetch_age_prompt
+            _cache.fetch_age_checked_at = old.fetch_age_checked_at
             _cache.repo_signature = old.repo_signature
         end
     end
     refresh_python_env()
     refresh_git_identity_cache(gd, workspace_dir, root)
+    _cache.git_is_remote = is_remote_path(cwd)
     refresh_git_action_cache()
     refresh_git_state_cache()
 end
@@ -810,6 +891,13 @@ local B_R     = 82
 local B_T     = 84
 local B_U     = 85
 local B_u     = 117
+
+-- Coroutines execute on Clink's input thread.  Check both record and byte
+-- budgets, then yield once a slice consumes about 1ms.  The byte budget also
+-- protects responsiveness for unusually long Windows paths.
+local STATUS_SLICE_SECONDS = 0.001
+local STATUS_SLICE_LINES = 32
+local STATUS_SLICE_BYTES = 16384
 
 local function has_status_change_byte(c)
     return c and c ~= B_DOT and c ~= B_SPACE
@@ -886,61 +974,82 @@ local function read_status_porcelain(info, scan_untracked)
         return false
     end
 
-    -- single bulk read keeps Lua<->C crossings low even for huge outputs
-    local content = file:read('*a')
-    local ok
-    if pclose then
-        ok = pclose()
-    else
-        ok = file:close()
-    end
-    if not ok or not content then
-        return false
-    end
-
     local oid = nil
-    local lines = 0
+    local entries = 0
+    local slice_lines, slice_bytes = 0, 0
+    local slice_started = clock()
     local conflicted, deleted, modified, renamed, staged, tracked, untracked = 0, 0, 0, 0, 0, 0, 0
-    for line in content:gmatch('[^\r\n]+') do
-        -- coroutines resume on the input thread: yield periodically so a huge
-        -- status output can't stall keystrokes while it is parsed
-        lines = lines + 1
-        if lines % 5000 == 0 then
-            maybe_yield()
-        end
-        local kind = line:byte(1)
-        if kind == B_HASH then
-            if line:sub(1, 8) == '# stash ' then
-                info.stash_count = to_int(line:sub(9))
-            elseif line:sub(1, 14) == '# branch.head ' then
-                info.branch = line:sub(15)
-            elseif line:sub(1, 13) == '# branch.oid ' then
-                oid = line:sub(14)
-            elseif line:sub(1, 18) == '# branch.upstream ' then
-                info.upstream = line:sub(19)
-            elseif line:sub(1, 12) == '# branch.ab ' then
-                parse_branch_ab(info, line)
+    local limit = config.status_entry_limit
+    local parse_ok = pcall(function ()
+        while true do
+            local line = file:read('*l')
+            if line == nil then break end
+
+            slice_lines = slice_lines + 1
+            slice_bytes = slice_bytes + #line
+            if slice_lines >= STATUS_SLICE_LINES or slice_bytes >= STATUS_SLICE_BYTES then
+                if clock() - slice_started >= STATUS_SLICE_SECONDS then
+                    maybe_yield()
+                    slice_started = clock()
+                end
+                slice_lines, slice_bytes = 0, 0
             end
-        elseif kind == B_QMARK then
-            untracked = untracked + 1
-        elseif kind == B_1 or kind == B_2 or kind == B_u then
-            local x, y = line:byte(3), line:byte(4)
-            if kind == B_u or x == B_U or y == B_U or
-                (x == B_A and y == B_A) or (x == B_D and y == B_D) then
-                conflicted = conflicted + 1
-            elseif x == B_D or y == B_D then
-                deleted = deleted + 1
-            elseif y == B_M or y == B_T then
-                modified = modified + 1
-            elseif x == B_R or x == B_C then
-                renamed = renamed + 1
-            elseif has_status_change_byte(x) then
-                staged = staged + 1
-            elseif has_status_change_byte(y) then
-                tracked = tracked + 1
+
+            local kind = line:byte(1)
+            if kind == B_HASH then
+                if line:sub(1, 8) == '# stash ' then
+                    info.stash_count = to_int(line:sub(9))
+                elseif line:sub(1, 14) == '# branch.head ' then
+                    info.branch = line:sub(15)
+                elseif line:sub(1, 13) == '# branch.oid ' then
+                    oid = line:sub(14)
+                elseif line:sub(1, 18) == '# branch.upstream ' then
+                    info.upstream = line:sub(19)
+                elseif line:sub(1, 12) == '# branch.ab ' then
+                    parse_branch_ab(info, line)
+                end
+            elseif kind == B_QMARK then
+                entries = entries + 1
+                untracked = untracked + 1
+            elseif kind == B_1 or kind == B_2 or kind == B_u then
+                entries = entries + 1
+                local x, y = line:byte(3), line:byte(4)
+                if kind == B_u or x == B_U or y == B_U or
+                    (x == B_A and y == B_A) or (x == B_D and y == B_D) then
+                    conflicted = conflicted + 1
+                else
+                    -- X is the staged/index state and Y is the independent
+                    -- worktree state.  A path such as MM, AM, or RM must
+                    -- contribute to both relevant prompt categories.
+                    if x == B_D or y == B_D then deleted = deleted + 1 end
+                    if x == B_R or x == B_C then renamed = renamed + 1 end
+                    if has_status_change_byte(x) and x ~= B_D and x ~= B_R and x ~= B_C then
+                        staged = staged + 1
+                    end
+                    if y == B_M or y == B_T then
+                        modified = modified + 1
+                    elseif has_status_change_byte(y) and y ~= B_D then
+                        tracked = tracked + 1
+                    end
+                end
+            end
+
+            if limit and limit > 0 and entries >= limit then
+                info.truncated = true
+                break
             end
         end
+    end)
+
+    -- pclose closes the handle and reports Git's exit status even if parsing
+    -- stopped at the configured entry bound.  Always close after read errors.
+    local close_ok
+    if pclose then
+        close_ok = pclose()
+    else
+        close_ok = file:close()
     end
+    if not parse_ok or not close_ok then return false end
 
     update_status_branch(info, oid)
     info.conflicted = conflicted
@@ -973,6 +1082,7 @@ local function collect_status()
         deleted      = 0,
         conflicted   = 0,
         stash_count  = 0,
+        truncated    = false,
         dirty_branch = nil,
         dirty_dir    = nil,
     }
@@ -984,6 +1094,7 @@ local function collect_status()
 
     if not scan_untracked then
         info.untracked = _cache.git_untracked_count
+        info.truncated = info.truncated or _cache.git_untracked_truncated
     end
     info.untracked_refreshed = scan_untracked
     info.dirty_dir  = info.untracked > 0 or false
@@ -1013,6 +1124,9 @@ local function git_render(info)
     if info.staged > 0 then parts[#parts + 1] = (fmt.staged):format(info.staged) end
     if info.tracked > 0 then parts[#parts + 1] = (fmt.tracked):format(info.tracked) end
     if info.untracked > 0 then parts[#parts + 1] = (fmt.untracked):format(info.untracked) end
+    if info.truncated then
+        parts[#parts + 1] = (fmt.truncated):format(config.status_entry_limit or 0)
+    end
 
     -- color is applied at render time in rightfilter so pending status can be dimmed
     return concat(parts, ' ')
@@ -1020,11 +1134,13 @@ end
 
 local function fmt_duration(s)
     -- clock precision 1e-6
-    if not s or s < 1e-6 then return '' end
+    if s == nil then return '' end
+    if s <= 0 then return '0ms' end
 
     -- round to the display unit first so rollover can't render '1000µs' or '1m60s'
     if s < 1e-3 then
         local us = floor(s*1000000 + 0.5)
+        if us == 0 then return '0ms' end
         if us < 1000 then return format('%dµs', us) end
         s = us * 1e-6
     end
@@ -1050,14 +1166,10 @@ end
 -- measure the duration of last run command
 -- blank input is measured too: it shows the real Enter-to-prompt roundtrip
 -- (including cmd's hidden errorlevel capture), never a stale reading
-local last_start, last_dur_s
-local last_input_blank = false
 -- true when the last input provably couldn't change git state
-local last_input_neutral = false
 -- bumped whenever an input line (or a repo change seen by the watcher) may
 -- have changed git state; an async status collection is applied only when
 -- the count it started with is still current
-local mutation_count = 0
 
 -- commands that can't change git state as long as no redirection is involved
 local NEUTRAL_CMDS = {
@@ -1093,7 +1205,10 @@ local function is_status_neutral_input(line)
     end
     first = first:lower()
     -- doskey aliases can remap any name to an arbitrary command line
-    if os.getaliases then
+    if os.getalias then
+        local ok, alias = pcall(os.getalias, first)
+        if ok and alias then return false end
+    elseif os.getaliases then
         local aliases = os.getaliases()
         if aliases then
             for i = 1, #aliases do
@@ -1196,7 +1311,16 @@ end
 -- the repo is still the same and no git-mutating input ran meanwhile.
 local status_inflight = nil    -- refresh currently collecting, nil when idle
 local inflight_count = 0       -- includes abandoned refreshes still finishing
+local refresh_pending = false  -- newest state still needs a collector
+local MAX_INFLIGHT = 2         -- bound Git processes/temp output under churn
 local repo_signature           -- assigned below; called only after script load
+
+local function prompt_async_enabled()
+    local api = rawget(_G, 'settings')
+    if not (api and api.get) then return true end
+    local ok, enabled = pcall(api.get, 'prompt.async')
+    return not ok or enabled ~= false
+end
 
 local function try_repo_signature()
     if not repo_signature then return nil end
@@ -1256,6 +1380,7 @@ local function apply_status_response(rec, response)
     if info.untracked_refreshed then
         _cache.git_untracked_at = response.finished_at or clock()
         _cache.git_untracked_count = info.untracked
+        _cache.git_untracked_truncated = info.truncated and true or false
     end
     if config.profile and response.duration then
         _cache.git_duration = fmt_duration(response.duration)
@@ -1270,29 +1395,44 @@ local function traceback_error(err)
     return tostring(err)
 end
 
-local function start_status_refresh()
+local start_status_refresh
+start_status_refresh = function ()
     if not _cache.git_dir then
+        refresh_pending = false
         return
     end
+    if not prompt_async_enabled() then
+        if status_inflight then
+            status_inflight.abandoned = true
+            status_inflight = nil
+        end
+        refresh_pending = false
+        _cache.git_status_unavailable = config.status_format.async_off
+        _cache.git_status_failed = false
+        return
+    end
+    _cache.git_status_unavailable = nil
     if status_inflight then
         if status_inflight.mutation == mutation_count and status_inflight.git_dir == _cache.git_dir then
             -- a refresh for exactly this state is already collecting
+            refresh_pending = false
             return
         end
         status_inflight.abandoned = true
         status_inflight = nil
     end
-    if inflight_count >= 4 then
-        -- git is hanging (network repo?); don't pile up more processes
-        _cache.git_status_failed = true
+    if inflight_count >= MAX_INFLIGHT then
+        -- Coalesce arbitrarily many mutations into one newest-state refresh.
+        -- Completion of either obsolete collector starts it automatically.
+        refresh_pending = true
         return
     end
 
     local rec = { git_dir = _cache.git_dir, mutation = mutation_count }
+    refresh_pending = false
     inflight_count = inflight_count + 1
     rec.co = coroutine.create(function ()
         local ok, response = xpcall(function () return collect_profile(rec) end, traceback_error)
-        inflight_count = math.max(0, inflight_count - 1)
         if status_inflight == rec then
             status_inflight = nil
         end
@@ -1311,10 +1451,17 @@ local function start_status_refresh()
             end
             if applied then
                 -- This may itself yield for one async config read, but status
-                -- state has already been safely committed and cleaned up.
-                check_fsmonitor_hint(response.duration, rec.git_dir)
+                -- state has already been safely committed.
+                pcall(check_fsmonitor_hint, response.duration, rec.git_dir)
             end
             pcall(clink.refilterprompt)
+        end
+        -- Count the complete coroutine lifetime, including the optional
+        -- fsmonitor config query, so the external-process bound is real.
+        inflight_count = math.max(0, inflight_count - 1)
+        if refresh_pending and not status_inflight and _cache.git_dir and
+            inflight_count < MAX_INFLIGHT then
+            start_status_refresh()
         end
     end)
     status_inflight = rec
@@ -1380,7 +1527,8 @@ repo_signature = function ()
 end
 
 local function start_repo_watcher()
-    if not config.watch_repo or watcher_started or not _cache.git_dir then
+    if not config.watch_repo or watcher_started or not _cache.git_dir or
+        (_cache.git_is_remote and not config.watch_remote_repo) then
         return
     end
     watcher_started = true
@@ -1412,7 +1560,7 @@ local function start_repo_watcher()
                 _cache.git_status_at = nil
                 refresh_git_action_cache()
                 refresh_git_state_cache()
-                pcall(refresh_fetch_age)
+                pcall(refresh_fetch_age, true)
                 start_status_refresh()
                 clink.refilterprompt()
             end
@@ -1512,8 +1660,12 @@ local RIGHT_DROP_ORDER = {
     'python',
     'upstream',
     'profile_duration',
-    'command_duration',
     'clock',
+    -- Command duration is the one per-command historical measurement and is
+    -- never intentionally discarded.  On very narrow terminals it outranks
+    -- cached Git fields, which can reappear on the next wider render.
+    'git_status',
+    'stash',
 }
 
 local function fit_right_prompt(segments)
@@ -1541,8 +1693,8 @@ local function fit_right_prompt(segments)
         if fits(rendered) then return rendered end
     end
 
-    -- The remaining Git status/stash fields cannot physically coexist with
-    -- the left prompt and safety gap.  Returning empty avoids clipped output.
+    -- Even the command duration cannot physically coexist with the left
+    -- prompt and safety gap.  Returning empty is the only non-clipping result.
     return ''
 end
 
@@ -1564,7 +1716,7 @@ function pf:filter()
     start_repo_watcher()
     git_status_stale = _cache.git_dir ~= nil and
         ((status_inflight ~= nil and status_inflight.git_dir == _cache.git_dir) or
-         _cache.git_status_failed)
+         refresh_pending or _cache.git_status_failed)
 
     local dir_color = config.color.reset
     if _cache.dirty_dir ~= nil then
@@ -1587,7 +1739,9 @@ function pf:rightfilter()
     -- in a repo the status render must not be an empty string or the right
     -- prompt doesn't get redrawn after async! - with no glyphs still emit colors
     local git_status_prompt = nil
-    if _cache.git_render_text then
+    if _cache.git_status_unavailable then
+        git_status_prompt = config.color.took .. _cache.git_status_unavailable .. config.color.reset
+    elseif _cache.git_render_text then
         local color = config.color.clean
         if config.dim_stale_status and git_status_stale then
             color = config.color.took
@@ -1719,6 +1873,7 @@ local function run_legend()
         { 'tracked',        sample(fmt.tracked),        'untracked',  sample(fmt.untracked) },
         { 'stashed',        sample(fmt.stashed),        'ab unknown', fmt.ab_unknown },
         { 'fetch age',      sample(fmt.fetch_age, 'Nd'), 'collecting', fmt.pending },
+        { 'entry limit',    sample(fmt.truncated),       'async off',  fmt.async_off },
     })
     print_rows('action', col.state, {
         { 'int rebase',     act.rebase_i,       'rebase merge', act.rebase_m },
@@ -1741,11 +1896,11 @@ end
 local function command_input_filter(text)
     if text and text:match('^%s*snapline%-bench%s*$') then
         run_bench()
-        return ''
+        return '', false
     end
     if text and text:match('^%s*snapline%-legend%s*$') then
         run_legend()
-        return ''
+        return '', false
     end
 end
 
@@ -1768,6 +1923,7 @@ local function on_endedit(line)
         -- reuse a count known to predate that command.
         _cache.git_untracked_at = nil
         _cache.git_status_at = nil
+        _cache.fetch_age_checked_at = nil
     end
     last_start = clock()
 end

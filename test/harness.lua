@@ -71,7 +71,8 @@ local H  -- per-suite harness state
 local G = {}  -- git repo state
 local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
             raise = false, stash_count = 2, config_value = '',
-            errorlevel = 0, aliases = {}, env = {} }
+            errorlevel = 0, aliases = {}, env = {}, async = true,
+            remote = false, clock_step = 0 }
 local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
@@ -156,12 +157,24 @@ io.popenyield = function (cmd)
         out = P.config_value or ''
     end
     local yielded = false
+    local pos = 1
     local file = {
-        read = function ()
+        read = function (_, mode)
             if P.raise then error('simulated popen read failure') end
             if P.slow and not yielded then
                 yielded = true
                 coroutine.yield()
+            end
+            if mode == '*l' then
+                if pos > #out then return nil end
+                local nl = out:find('\n', pos, true)
+                local line
+                if nl then
+                    line, pos = out:sub(pos, nl - 1), nl + 1
+                else
+                    line, pos = out:sub(pos), #out + 1
+                end
+                return line
             end
             return out
         end,
@@ -175,7 +188,17 @@ os.getcwd = function () return CWD.path end
 os.getenv = function (name) return P.env[name] end
 os.geterrorlevel = function () return P.errorlevel end
 os.getaliases = function () return P.aliases end
-os.clock = function () return NOW end
+os.getalias = function (name)
+    for i = 1, #P.aliases do
+        if P.aliases[i]:lower() == name:lower() then return 'replacement' end
+    end
+end
+os.getdrivetype = function () return P.remote and 'remote' or 'fixed' end
+os.clock = function ()
+    local value = NOW
+    NOW = NOW + P.clock_step
+    return value
+end
 
 -- ===== session simulation =====
 local function beginedit()
@@ -185,9 +208,14 @@ end
 local function endedit(line)
     for i = 1, #H.endedit do H.endedit[i](line) end
     local replaced
+    H.filter_stopped = false
     for i = 1, #H.filterinput do
-        local r = H.filterinput[i](line)
+        local r, continue = H.filterinput[i](line)
         if r ~= nil then replaced = r end
+        if continue == false then
+            H.filter_stopped = true
+            break
+        end
     end
     -- clink cancels coroutines at session end unless runcoroutineuntilcomplete
     local alive = {}
@@ -223,6 +251,9 @@ local function load_snapline(overrides)
     rawset(_G, 'clink', make_clink_stub())
     rawset(_G, 'git', make_git_stub())
     rawset(_G, 'console', make_console_stub())
+    rawset(_G, 'settings', { get = function (name)
+        if name == 'prompt.async' then return P.async end
+    end })
     G.gitdir, G.branch, G.action, G.commondir = nil, nil, nil, nil
     G.workspace_dir, G.root = nil, nil
     G.action_step, G.action_total = nil, nil
@@ -230,6 +261,7 @@ local function load_snapline(overrides)
     P.calls, P.lastcmd, P.porcelain = 0, '', ''
     P.fail, P.slow, P.raise, P.stash_count = false, false, false, 2
     P.config_value, P.errorlevel, P.aliases, P.env = '', 0, {}, {}
+    P.async, P.remote, P.clock_step = true, false, 0
     CWD.path = 'C:\\work\\proj'
     NOW = 1000
     dofile(SNAPLINE)
@@ -270,6 +302,15 @@ local PORC_AB_UNKNOWN = table.concat({
     '# branch.upstream origin/main',
     '# branch.ab +? -?',
 }, '\n')
+local PORC_COMBINED = table.concat({
+    '# branch.oid 1234567890abcdef',
+    '# branch.head main',
+    '# branch.upstream origin/main',
+    '# branch.ab +0 -0',
+    '1 AM N... 000000 100644 100644 aaa bbb added-then-modified.txt',
+    '1 MM N... 100644 100644 100644 aaa bbb staged-and-modified.txt',
+    '2 RM N... 100644 100644 100644 aaa bbb R100 renamed-and-modified.txt\toriginal.txt',
+}, '\n')
 
 -- =====================================================================
 print('===== suite 1: default config =====')
@@ -292,6 +333,12 @@ beginedit()
 right = plain(H.pf:rightfilter())
 check(right:match('^7ms %d%d:%d%d:%d%d$') ~= nil,
     'single-digit duration has no leading empty space')
+
+endedit('echo zero duration')
+beginedit()
+right = plain(H.pf:rightfilter())
+check(right:match('^0ms %d%d:%d%d:%d%d$') ~= nil,
+    'exact-zero command duration is always rendered as 0ms')
 
 -- T2 first status in a repo
 G.gitdir, G.branch = REPO_GD, 'main'
@@ -441,6 +488,19 @@ beginedit(); H.pf:filter(); tick(); H.pf:filter()
 right = H.pf:rightfilter()
 check(plain(right):find('⇡?', 1, true) ~= nil, 'ab_unknown glyph rendered for +? -?')
 
+-- X (index) and Y (worktree) are independent dimensions.  A single path can
+-- therefore contribute to both staged/renamed and modified counters.
+P.porcelain = PORC_COMBINED
+endedit('git add combined')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+pright = plain(H.pf:rightfilter())
+check(pright:find('+2', 1, true) ~= nil and pright:find('!3', 1, true) ~= nil and
+      pright:find('»1', 1, true) ~= nil,
+    'combined AM/MM/RM states count staged, modified, and renamed independently')
+P.porcelain = PORC_AB_UNKNOWN
+endedit('git reset combined fixture')
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+
 -- T9 cd within the same repo carries the status
 CWD.path = 'C:\\work\\proj\\sub'
 local c9 = P.calls
@@ -574,6 +634,7 @@ check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
 local before_bench = #H.printed
 local replaced = endedit('snapline-bench')
 check(replaced == '', 'snapline-bench replaced with empty command line')
+check(H.filter_stopped, 'snapline-bench prevents later input filters from rewriting it')
 local bench_out = table.concat(H.printed, '\n', before_bench + 1)
 check(bench_out:find('snapline bench', 1, true) ~= nil, 'bench printed results')
 check(bench_out:find('collect_status', 1, true) ~= nil, 'bench included snapline alternatives')
@@ -582,6 +643,7 @@ check(bench_out:find('collect_status', 1, true) ~= nil, 'bench included snapline
 local before_legend = #H.printed
 replaced = endedit('snapline-legend')
 check(replaced == '', 'snapline-legend replaced with empty command line')
+check(H.filter_stopped, 'snapline-legend prevents later input filters from rewriting it')
 local legend_out = table.concat(H.printed, '\n', before_legend + 1)
 check(legend_out:find('diverged', 1, true) ~= nil and legend_out:find('⇕⇡A⇣B', 1, true) ~= nil,
     'legend shows composed diverged sample')
@@ -690,11 +752,15 @@ local left_cells = console.cellcount(left)
 H.console_width = left_cells + 4 + console.cellcount(essential)
 left = H.pf:filter()
 local narrow_right = plain(H.pf:rightfilter())
-check(narrow_right == essential,
-    'narrow right prompt drops ancillary fields but preserves git status and stash')
-H.console_width = left_cells + 4 + console.cellcount(essential) - 1
+check(narrow_right == '≡2 7ms',
+    'narrow right prompt preserves command timing and remaining high-value state')
+H.console_width = left_cells + 4 + console.cellcount('7ms')
 left = H.pf:filter()
-check(H.pf:rightfilter() == '', 'right prompt hides only when essential git state cannot fit')
+check(plain(H.pf:rightfilter()) == '7ms',
+    'command timing outlives git and stash fields on an extremely narrow prompt')
+H.console_width = left_cells + 4 + console.cellcount('7ms') - 1
+left = H.pf:filter()
+check(H.pf:rightfilter() == '', 'right prompt hides only when command timing cannot fit')
 H.console_width = 200
 
 P.porcelain = PORC_CLEAN
@@ -730,6 +796,73 @@ CWD.path = G.root
 beginedit()
 check(plain(H.pf:filter()):find(' sub ', 1, true) ~= nil,
     'submodule marker derives from git workspace identity')
+
+-- =====================================================================
+print('===== suite 6: bounded and time-sliced status parsing =====')
+load_snapline({ status_entry_limit = 2 })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_COMBINED
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+pright = plain(H.pf:rightfilter())
+check(pright:find('+2', 1, true) ~= nil and pright:find('!2', 1, true) ~= nil,
+    'entry bound preserves lower-bound counters from parsed records')
+check(pright:find('≥2', 1, true) ~= nil,
+    'entry bound is explicit rather than presenting partial counts as exact')
+
+load_snapline({ status_entry_limit = false })
+G.gitdir, G.branch = REPO_GD, 'main'
+local many = {
+    '# branch.oid 1234567890abcdef', '# branch.head main',
+    '# branch.upstream origin/main', '# branch.ab +0 -0',
+}
+for i = 1, 160 do
+    many[#many + 1] = '1 .M N... 100644 100644 100644 aaa bbb path' .. i
+end
+P.porcelain = table.concat(many, '\n')
+P.clock_step = 0.0006
+beginedit(); H.pf:filter(); tick()
+check(plain(H.pf:rightfilter()):find('…', 1, true) ~= nil,
+    'large parser yields within its time slice while pending remains renderable')
+P.clock_step = 0
+tick(); H.pf:filter()
+check(plain(H.pf:rightfilter()):find('!160', 1, true) ~= nil,
+    'time-sliced parser resumes and applies the complete result')
+
+-- =====================================================================
+print('===== suite 7: overload recovery and nonblocking policy =====')
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain, P.slow = PORC_DIRTY, true
+beginedit(); H.pf:filter(); tick()  -- collector A starts and yields
+local overload_calls = P.calls
+endedit('git add overload-b')
+beginedit(); H.pf:filter()          -- collector B allocated, not resumed
+endedit('git add overload-c')
+P.porcelain = PORC_AHEAD
+beginedit(); H.pf:filter()          -- cap reached; newest refresh is pending
+tick()                              -- A completes; pending collector C is allocated; B starts
+tick()                              -- B completes; C starts and yields
+tick()                              -- C completes and applies newest state
+H.pf:filter()
+check(P.calls == overload_calls + 2,
+    'overload coalesces mutations and never exceeds two concurrent collectors')
+check(plain(H.pf:rightfilter()):find('⇡1', 1, true) ~= nil,
+    'capacity recovery automatically applies the newest state without another Enter')
+
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+P.async = false
+beginedit(); H.pf:filter(); tick()
+check(P.calls == 0, 'prompt.async=false never falls back to blocking git status')
+check(plain(H.pf:rightfilter()):find('async-off', 1, true) ~= nil,
+    'disabled async status is explicit instead of an endless pending glyph')
+
+load_snapline(nil)
+G.gitdir, G.branch = REPO_GD, 'main'
+P.remote = true
+beginedit(); left = H.pf:filter(); tick()
+check(P.calls == 0 and plain(left):find('main', 1, true) == nil,
+    'remote repositories are skipped by default to preserve bounded prompt latency')
 
 print('')
 print(string.format('%d tests, %d failures', tests, fails))
