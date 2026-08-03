@@ -350,6 +350,34 @@ local function maybe_yield()
     end
 end
 
+-- Clink's scheduler resumes coroutines from a live pairs() traversal of its
+-- private registry, and coroutine.create registers into that same table, so
+-- creating a coroutine from inside a scheduled coroutine mutates the table
+-- mid-traversal.  That is undefined behavior for next(): a rehash can make
+-- Clink revisit an entry that already completed during the pass and resume
+-- it dead ("coroutine failed: cannot resume dead coroutine").  Queue such
+-- creations and run them from Clink's after-pass hook instead; without the
+-- hook, fall back to immediate creation.
+local deferred_spawns = {}
+local function drain_deferred_spawns()
+    while #deferred_spawns > 0 do
+        local spawn = table.remove(deferred_spawns, 1)
+        pcall(spawn)
+    end
+end
+local clink_internal = rawget(_G, 'internal')
+local spawn_hook_ok = (type(clink_internal) == 'table' and
+    type(clink_internal._after_coroutines) == 'function' and
+    pcall(clink_internal._after_coroutines, drain_deferred_spawns)) or false
+local function defer_spawn(fn)
+    local _, is_main = coroutine.running()
+    if is_main or not spawn_hook_ok then
+        fn()
+    else
+        deferred_spawns[#deferred_spawns + 1] = fn
+    end
+end
+
 local function set_pyvenv_cache(path, version, stamp)
     local c = _cache.pyvenv_cache
     c.path, c.version, c.stamp, c.checked_at = path, version, stamp, clock()
@@ -1456,6 +1484,14 @@ end
 
 local start_status_refresh
 start_status_refresh = function ()
+    local _, is_main = coroutine.running()
+    if not is_main and spawn_hook_ok then
+        -- Keep the refresh visibly pending until the deferred call
+        -- re-evaluates full state on the main thread.
+        refresh_pending = true
+        defer_spawn(start_status_refresh)
+        return
+    end
     if not _cache.git_dir then
         refresh_pending = false
         return
@@ -1649,6 +1685,15 @@ end
 
 local start_repo_watcher
 local function arm_repo_watcher(generation)
+    local _, is_main = coroutine.running()
+    if not is_main and spawn_hook_ok then
+        defer_spawn(function ()
+            if watcher_started and generation == _cache.repo_generation then
+                arm_repo_watcher(generation)
+            end
+        end)
+        return
+    end
     local co = coroutine.create(function ()
         coroutine.yield()
         if generation ~= _cache.repo_generation then

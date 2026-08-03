@@ -78,11 +78,24 @@ local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
 local real_create = coroutine.create
+local creates_inside_co = 0
 coroutine.create = function (f)
+    local _, is_main = coroutine.running()
+    if not is_main then creates_inside_co = creates_inside_co + 1 end
     local co = real_create(f)
     if H then H.cos[#H.cos + 1] = co end
     return co
 end
+
+-- Clink's after-pass hook: snapline defers coroutine creation through it so
+-- Clink's registry is never mutated while its scheduler iterates it.  The
+-- stub captures the callbacks; tick() runs them after each pass like clink
+-- does.  __index keeps clink's real internal functions reachable.
+local after_pass = {}
+local REAL_INTERNAL = rawget(_G, 'internal')
+rawset(_G, 'internal', setmetatable({
+    _after_coroutines = function (f) after_pass[#after_pass + 1] = f end,
+}, { __index = REAL_INTERNAL }))
 
 local function make_clink_stub()
     return {
@@ -258,11 +271,13 @@ local function tick()
             end
         end
     end
+    for i = 1, #after_pass do after_pass[i]() end
 end
 
 local function load_snapline(overrides)
     H = { cos = {}, keep = {}, beginedit = {}, endedit = {}, filterinput = {},
           refilters = 0, printed = {}, pf = nil, active_prompt = '', console_width = 200 }
+    for i = #after_pass, 1, -1 do after_pass[i] = nil end
     rawset(_G, 'snapline_config', overrides)
     rawset(_G, 'clink', make_clink_stub())
     rawset(_G, 'git', make_git_stub())
@@ -993,6 +1008,13 @@ local rewritten_calls = P.calls
 endedit('dir'); beginedit(); H.pf:filter(); tick()
 check(P.calls == rewritten_calls + 1,
     'cache invalidation classifies text rewritten by earlier input filters')
+
+-- Regression for "coroutine failed: cannot resume dead coroutine": creating
+-- a coroutine from inside a scheduled coroutine mutates clink's registry
+-- mid-traversal, so clink can resume an already-dead entry.  Every creation
+-- across all suites must have happened on the main thread.
+check(creates_inside_co == 0,
+    'no coroutine is ever created from inside another coroutine')
 
 print('')
 print(string.format('%d tests, %d failures', tests, fails))
