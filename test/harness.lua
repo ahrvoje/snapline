@@ -87,16 +87,6 @@ coroutine.create = function (f)
     return co
 end
 
--- Clink's after-pass hook: snapline defers coroutine creation through it so
--- Clink's registry is never mutated while its scheduler iterates it.  The
--- stub captures the callbacks; tick() runs them after each pass like clink
--- does.  __index keeps clink's real internal functions reachable.
-local after_pass = {}
-local REAL_INTERNAL = rawget(_G, 'internal')
-rawset(_G, 'internal', setmetatable({
-    _after_coroutines = function (f) after_pass[#after_pass + 1] = f end,
-}, { __index = REAL_INTERNAL }))
-
 local function make_clink_stub()
     return {
         promptfilter = function () H.pf = {}; return H.pf end,
@@ -271,13 +261,11 @@ local function tick()
             end
         end
     end
-    for i = 1, #after_pass do after_pass[i]() end
 end
 
 local function load_snapline(overrides)
     H = { cos = {}, keep = {}, beginedit = {}, endedit = {}, filterinput = {},
           refilters = 0, printed = {}, pf = nil, active_prompt = '', console_width = 200 }
-    for i = #after_pass, 1, -1 do after_pass[i] = nil end
     rawset(_G, 'snapline_config', overrides)
     rawset(_G, 'clink', make_clink_stub())
     rawset(_G, 'git', make_git_stub())
@@ -475,14 +463,14 @@ P.slow = true
 local c6 = P.calls
 endedit('git add a')
 beginedit(); H.pf:filter()
-tick()  -- co1 starts its popen and yields mid-read
+tick()  -- collection A starts its popen and yields mid-read
 check(P.calls == c6 + 1, 'slow refresh started')
 local r0 = H.refilters
 endedit('git add b')
 beginedit(); H.pf:filter()
-tick()  -- co1 completes abandoned; co2 starts and yields
+tick()  -- A completes stale and is dropped; collection B starts and yields
 check(P.calls == c6 + 2, 'in-flight refresh abandoned after mutating input, new one started')
-tick()  -- co2 completes and applies
+tick()  -- B completes and applies
 check(H.refilters == r0 + 1, 'abandoned refresh did not apply or refilter')
 P.slow = false
 H.pf:filter()
@@ -503,7 +491,7 @@ H.pf:filter()
 right = H.pf:rightfilter()
 check(color_at(right, '+1') == DIRTY_SGR, 'status recovers after blank-Enter retry')
 
--- Exceptions inside collection must clean up inflight bookkeeping and permit
+-- Exceptions inside collection must clear the collecting marker and permit
 -- the following session to retry normally.
 P.raise = true
 endedit('git add throws')
@@ -568,7 +556,7 @@ local calls0, ref1 = P.calls, H.refilters
 local fh = io.open(REPO_GD .. '\\index', 'ab')
 fh:write('x'); fh:close()
 tick()
-check(H.refilters == ref1 + 1, 'watcher detects change before its first probe')
+check(H.refilters == ref1 + 1, 'watcher detects external change while idle')
 tick()
 check(P.calls == calls0 + 1, 'watcher-triggered status ran')
 check(H.refilters == ref1 + 2, 'watcher-triggered status applied and refiltered')
@@ -871,21 +859,20 @@ print('===== suite 7: overload recovery and nonblocking policy =====')
 load_snapline(nil)
 G.gitdir, G.branch = REPO_GD, 'main'
 P.porcelain, P.slow = PORC_DIRTY, true
-beginedit(); H.pf:filter(); tick()  -- collector A starts and yields
+beginedit(); H.pf:filter(); tick()  -- collection A starts and yields mid-read
 local overload_calls = P.calls
 endedit('git add overload-b')
-beginedit(); H.pf:filter()          -- collector B allocated, not resumed
+beginedit(); H.pf:filter()          -- newest state marked pending, no extra process
 endedit('git add overload-c')
 P.porcelain = PORC_AHEAD
-beginedit(); H.pf:filter()          -- cap reached; newest refresh is pending
-tick()                              -- A completes; pending collector C is allocated; B starts
-tick()                              -- B completes; C starts and yields
-tick()                              -- C completes and applies newest state
+beginedit(); H.pf:filter()          -- still coalescing behind the one in-flight process
+tick()                              -- A completes stale and is dropped; B starts and yields
+tick()                              -- B collects the newest state and applies it
 H.pf:filter()
-check(P.calls == overload_calls + 2,
-    'overload coalesces mutations and never exceeds two concurrent collectors')
+check(P.calls == overload_calls + 1,
+    'overload coalesces mutations into one sequential follow-up collection')
 check(plain(H.pf:rightfilter()):find('⇡1', 1, true) ~= nil,
-    'capacity recovery automatically applies the newest state without another Enter')
+    'the worker automatically applies the newest state without another Enter')
 
 load_snapline(nil)
 G.gitdir, G.branch = REPO_GD, 'main'
@@ -917,13 +904,14 @@ P.clock_hook = function ()
     local f = assert(io.open(REPO_GD .. '\\index', 'ab'))
     f:write('t'); f:close()
 end
-tick()  -- post-status mutation rejects the first result and queues a retry
-check(P.calls == transactional_calls + 1,
-    'post-collection mutation rejects the first collected result')
-tick(); H.pf:filter()
+tick()  -- post-status mutation rejects the first result; the worker retries at once
+H.pf:filter()
 check(P.calls == transactional_calls + 2 and
       plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
     'transaction rejection automatically retries and applies a stable snapshot')
+tick()
+check(P.calls == transactional_calls + 2,
+    'a stable snapshot ends the transactional retry loop')
 
 load_snapline({ watch_repo = false, blank_input_reuse_age = 1 })
 G.gitdir, G.branch = REPO_GD, 'main'
@@ -969,12 +957,13 @@ check(P.calls == 1 and plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
 load_snapline({ watch_repo = false })
 G.gitdir, G.branch = REPO_GD, 'main'
 P.porcelain, P.registration_fail = PORC_STAGED, true
-beginedit(); H.pf:filter(); tick()
-check(P.calls == 0, 'coroutine registration failure starts no blocking status work')
-P.registration_fail = false
-endedit(''); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
 check(P.calls == 1 and plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
-    'scheduler bookkeeping rolls back and recovers after registration failure')
+    'untilcomplete registration failure degrades to a session-scoped refresh')
+P.registration_fail = false
+endedit('git add rereg'); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(P.calls == 2 and plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
+    'a replacement worker is registered after the failed session ends')
 
 load_snapline({ watch_interval = 0 })
 beginedit()

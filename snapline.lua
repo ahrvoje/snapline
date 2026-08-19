@@ -185,8 +185,7 @@ local config = {
     -- packed-refs, stash log, FETCH_HEAD, ...) and refresh the status when
     -- they change, so commits made from other terminals or editors show up
     -- without pressing Enter.  A probe costs microseconds; git runs only on
-    -- change.  Short-lived watcher coroutines are rearmed so Clink's long-run
-    -- five-second throttle cannot stretch the configured cadence.
+    -- change.
     watch_repo = true,
     watch_interval = 2.0,
     -- Network filesystem metadata calls can block the input thread.  Git
@@ -355,27 +354,14 @@ end
 -- creating a coroutine from inside a scheduled coroutine mutates the table
 -- mid-traversal.  That is undefined behavior for next(): a rehash can make
 -- Clink revisit an entry that already completed during the pass and resume
--- it dead ("coroutine failed: cannot resume dead coroutine").  Queue such
--- creations and run them from Clink's after-pass hook instead; without the
--- hook, fall back to immediate creation.
-local deferred_spawns = {}
-local function drain_deferred_spawns()
-    while #deferred_spawns > 0 do
-        local spawn = table.remove(deferred_spawns, 1)
-        pcall(spawn)
-    end
-end
-local clink_internal = rawget(_G, 'internal')
-local spawn_hook_ok = (type(clink_internal) == 'table' and
-    type(clink_internal._after_coroutines) == 'function' and
-    pcall(clink_internal._after_coroutines, drain_deferred_spawns)) or false
-local function defer_spawn(fn)
+-- it dead ("coroutine failed: cannot resume dead coroutine").  Therefore
+-- coroutines are only ever created on the main thread: the two creator
+-- functions below no-op in coroutine context (prompt filters can run on a
+-- coroutine stack via clink.refilterprompt), and code that runs inside a
+-- coroutine communicates through flags instead of creating coroutines.
+local function on_main_thread()
     local _, is_main = coroutine.running()
-    if is_main or not spawn_hook_ok then
-        fn()
-    else
-        deferred_spawns[#deferred_spawns + 1] = fn
-    end
+    return is_main
 end
 
 local function set_pyvenv_cache(path, version, stamp)
@@ -1354,15 +1340,21 @@ end
 
 -- async status collection
 --
--- Each refresh runs in its own coroutine marked runcoroutineuntilcomplete, so
--- unlike clink.promptcoroutine it survives Enter: on a slow repo the status
--- lands on a later prompt instead of being canceled and restarted (and
--- restarted...) by every command.  The result is applied to _cache only when
--- the repo is still the same and no git-mutating input ran meanwhile.
-local status_inflight = nil    -- refresh currently collecting, nil when idle
-local inflight_count = 0       -- includes abandoned refreshes still finishing
-local refresh_pending = false  -- newest state still needs a collector
-local MAX_INFLIGHT = 2         -- bound Git processes/temp output under churn
+-- All status work runs in one perpetual worker coroutine created on the main
+-- thread and marked runcoroutineuntilcomplete, so unlike clink.promptcoroutine
+-- a slow collection survives Enter: on a slow repo the status lands on a
+-- later prompt instead of being canceled and restarted (and restarted...) by
+-- every command.  Requests from any context only set a flag and zero the
+-- worker's resume interval (a plain field write inside Clink, safe even from
+-- coroutine context); the worker collects sequentially, never more than one
+-- git process, coalescing any number of mutations into one newest-state
+-- refresh.  The result is applied to _cache only when the repo is still the
+-- same and no git-mutating input ran meanwhile.
+local status_worker = nil      -- perpetual collector coroutine, nil until needed
+local worker_untilcomplete = false  -- registration survives edit-session ends
+local collecting = nil         -- {git_dir,mutation,generation} while a collection runs
+local refresh_pending = false  -- newest state still needs a collection
+local WORKER_IDLE_INTERVAL = 3600   -- parked; requests wake the worker via interval 0
 local repo_signature           -- assigned below; called only after script load
 local signature_context
 
@@ -1405,8 +1397,8 @@ local function collect_profile(rec)
         if stable then break end
         response.info = nil
         ctx = next_ctx
-        if rec and (rec.abandoned or rec.mutation ~= mutation_count or
-            rec.repo_generation ~= _cache.repo_generation) then
+        if rec.mutation ~= mutation_count or
+            rec.repo_generation ~= _cache.repo_generation then
             break
         end
     end
@@ -1482,108 +1474,110 @@ local function traceback_error(err)
     return tostring(err)
 end
 
-local start_status_refresh
-start_status_refresh = function ()
-    local _, is_main = coroutine.running()
-    if not is_main and spawn_hook_ok then
-        -- Keep the refresh visibly pending until the deferred call
-        -- re-evaluates full state on the main thread.
-        refresh_pending = true
-        defer_spawn(start_status_refresh)
-        return
-    end
+-- Ask for a status refresh of the current state.  Callable from any context:
+-- it never creates a coroutine, it only marks work pending and wakes the
+-- parked worker by zeroing its resume interval.
+local function request_status_refresh()
     if not _cache.git_dir then
         refresh_pending = false
         return
     end
     if not prompt_async_enabled() then
-        if status_inflight then
-            status_inflight.abandoned = true
-            status_inflight = nil
-        end
         refresh_pending = false
         _cache.git_status_unavailable = config.status_format.async_off
         _cache.git_status_failed = false
         return
     end
     _cache.git_status_unavailable = nil
-    if status_inflight then
-        if status_inflight.mutation == mutation_count and
-            status_inflight.repo_generation == _cache.repo_generation then
-            -- a refresh for exactly this state is already collecting
-            refresh_pending = false
-            return
-        end
-        status_inflight.abandoned = true
-        status_inflight = nil
-    end
-    if inflight_count >= MAX_INFLIGHT then
-        -- Coalesce arbitrarily many mutations into one newest-state refresh.
-        -- Completion of either obsolete collector starts it automatically.
-        refresh_pending = true
+    if collecting and collecting.mutation == mutation_count and
+        collecting.generation == _cache.repo_generation then
+        -- a collection for exactly this state is already running
+        refresh_pending = false
         return
     end
+    refresh_pending = true
+    if status_worker and clink.setcoroutineinterval then
+        pcall(clink.setcoroutineinterval, status_worker, 0)
+    end
+end
 
+local function run_status_collection()
     local rec = {
         git_dir = _cache.git_dir, repo_key = _cache.repo_key,
         repo_generation = _cache.repo_generation, mutation = mutation_count,
         cwd = get_cwd(), context = signature_context(),
     }
     rec.context.repo_key = rec.repo_key
-    refresh_pending = false
-    inflight_count = inflight_count + 1
-    rec.co = coroutine.create(function ()
-        if rec.registration_failed then
-            inflight_count = math.max(0, inflight_count - 1)
-            return
-        end
-        local ok, response = xpcall(function () return collect_profile(rec) end, traceback_error)
-        if status_inflight == rec then
-            status_inflight = nil
-        end
-        if not rec.abandoned then
-            local applied = false
-            if ok then
-                local apply_ok, result = xpcall(function ()
-                    return apply_status_response(rec, response)
-                end, traceback_error)
-                applied = apply_ok and result or false
-                if not apply_ok and rec.mutation == mutation_count and
-                    rec.repo_generation == _cache.repo_generation then
-                    _cache.git_status_failed = true
-                end
-            elseif rec.mutation == mutation_count and
-                rec.repo_generation == _cache.repo_generation then
-                _cache.git_status_failed = true
-            end
-            if applied then
-                -- This may itself yield for one async config read, but status
-                -- state has already been safely committed.
-                pcall(check_fsmonitor_hint, response.duration, rec.git_dir)
-            end
-            pcall(clink.refilterprompt)
-        end
-        -- Count the complete coroutine lifetime, including the optional
-        -- fsmonitor config query, so the external-process bound is real.
-        inflight_count = math.max(0, inflight_count - 1)
-        if refresh_pending and not status_inflight and _cache.git_dir and
-            inflight_count < MAX_INFLIGHT then
-            start_status_refresh()
-        end
-    end)
-    status_inflight = rec
-    -- clink auto-resumes created coroutines while editing is idle
-    if clink.setcoroutinename then pcall(clink.setcoroutinename, rec.co, 'snapline status') end
-    if clink.runcoroutineuntilcomplete then
-        local ok = pcall(clink.runcoroutineuntilcomplete, rec.co)
-        if not ok then
-            rec.registration_failed = true
-            status_inflight = nil
-            refresh_pending = false
+    collecting = { git_dir = rec.git_dir, mutation = rec.mutation,
+        generation = rec.repo_generation }
+    local ok, response = xpcall(function () return collect_profile(rec) end, traceback_error)
+    collecting = nil
+    if rec.mutation ~= mutation_count or rec.repo_generation ~= _cache.repo_generation or
+        _cache.git_status_unavailable then
+        -- Superseded mid-collection: the result describes a state that no
+        -- longer exists, and the follow-up collection owns the next refilter.
+        return
+    end
+    local applied = false
+    if ok then
+        local apply_ok, result = xpcall(function ()
+            return apply_status_response(rec, response)
+        end, traceback_error)
+        applied = apply_ok and result or false
+        if not apply_ok then
             _cache.git_status_failed = true
-            coroutine.resume(rec.co)
+        end
+    else
+        _cache.git_status_failed = true
+    end
+    if applied then
+        -- This may itself yield for one async config read, but status
+        -- state has already been safely committed.
+        pcall(check_fsmonitor_hint, response.duration, rec.git_dir)
+    end
+    pcall(clink.refilterprompt)
+end
+
+local function status_worker_loop()
+    local self = coroutine.running()
+    while true do
+        if refresh_pending then
+            refresh_pending = false
+            if _cache.git_dir and prompt_async_enabled() then
+                run_status_collection()
+            end
+        else
+            -- Park until a request zeroes the interval again; without the
+            -- large interval an idle worker would busy-wake every pass.
+            if clink.setcoroutineinterval then
+                pcall(clink.setcoroutineinterval, self, WORKER_IDLE_INTERVAL)
+            end
+            coroutine.yield()
+            if clink.setcoroutineinterval then
+                pcall(clink.setcoroutineinterval, self, 0)
+            end
         end
     end
+end
+
+local function ensure_status_worker()
+    if not on_main_thread() then
+        return
+    end
+    if status_worker and not worker_untilcomplete then
+        -- Without runcoroutineuntilcomplete clink canceled the worker at the
+        -- last edit-session end; it is orphaned, so replace it.
+        status_worker = nil
+    end
+    if status_worker and coroutine.status(status_worker) ~= 'dead' then
+        return
+    end
+    collecting = nil
+    status_worker = coroutine.create(status_worker_loop)
+    -- clink auto-resumes created coroutines while editing is idle
+    worker_untilcomplete = (clink.runcoroutineuntilcomplete and
+        pcall(clink.runcoroutineuntilcomplete, status_worker)) or false
+    if clink.setcoroutinename then pcall(clink.setcoroutinename, status_worker, 'snapline status') end
 end
 
 -- repo watcher: while idle at the prompt, µs-scale file probes detect git
@@ -1683,67 +1677,58 @@ repo_signature = function (ctx)
         identity = identity, work = work, fetch = fetch }
 end
 
-local start_repo_watcher
-local function arm_repo_watcher(generation)
-    local _, is_main = coroutine.running()
-    if not is_main and spawn_hook_ok then
-        defer_spawn(function ()
-            if watcher_started and generation == _cache.repo_generation then
-                arm_repo_watcher(generation)
-            end
-        end)
+-- One probe of the current repository state; runs inside the watcher
+-- coroutine.  It reads _cache fresh every time, so repository identity
+-- changes mid-session need no watcher restart.
+local function repo_watcher_probe()
+    local ok, sig = pcall(repo_signature)
+    if not ok or not sig then
         return
     end
-    local co = coroutine.create(function ()
-        coroutine.yield()
-        if generation ~= _cache.repo_generation then
-            watcher_started = false
-            start_repo_watcher()
-            return
-        end
-        local ok, sig = pcall(repo_signature)
-        local base = _cache.repo_observed_signature or _cache.repo_signature
-        if ok and sig then
-            if base and sig.all ~= base.all then
-                _cache.repo_observed_signature = sig
-                mutation_count = mutation_count + 1
-                if sig.identity ~= base.identity then _cache.identity_invalidated = true end
-                if sig.work ~= base.work then _cache.git_untracked_at = nil end
-                _cache.git_status_at = nil
-                refresh_git_action_cache()
-                refresh_git_state_cache()
-                if sig.fetch ~= base.fetch then pcall(refresh_fetch_age, true) end
-                start_status_refresh()
-                pcall(clink.refilterprompt)
-            elseif not base then
-                _cache.repo_observed_signature = sig
-            end
-        end
-        -- Rearming a short-lived coroutine avoids Clink's five-second
-        -- throttling of long-lived sub-five-second watchers.
-        if generation == _cache.repo_generation and watcher_started then
-            arm_repo_watcher(generation)
-        end
-    end)
-    -- Prime to the timer yield now; the first scheduled resume performs one
-    -- probe, so each short-lived watcher has exactly one interval of delay.
-    coroutine.resume(co)
-    if clink.setcoroutinename then pcall(clink.setcoroutinename, co, 'snapline watch') end
-    if clink.setcoroutineinterval and
-        not pcall(clink.setcoroutineinterval, co, config.watch_interval) then
-        watcher_started = false
+    local base = _cache.repo_observed_signature or _cache.repo_signature
+    if not base then
+        _cache.repo_observed_signature = sig
+        return
     end
+    if sig.all == base.all then
+        return
+    end
+    _cache.repo_observed_signature = sig
+    mutation_count = mutation_count + 1
+    if sig.identity ~= base.identity then _cache.identity_invalidated = true end
+    if sig.work ~= base.work then _cache.git_untracked_at = nil end
+    _cache.git_status_at = nil
+    refresh_git_action_cache()
+    refresh_git_state_cache()
+    if sig.fetch ~= base.fetch then pcall(refresh_fetch_age, true) end
+    request_status_refresh()
+    pcall(clink.refilterprompt)
 end
 
-start_repo_watcher = function ()
-    if not config.watch_repo or not clink.setcoroutineinterval or watcher_started or not _cache.git_dir or
-        (_cache.git_is_remote and not config.watch_remote_repo) then
+-- One long-lived watcher coroutine per input line session (lua.throttle_interval
+-- is 0 by default since clink 1.7.17, so a sub-five-second loop is not
+-- throttled).  Created without runcoroutineuntilcomplete: clink cancels it
+-- when the edit session ends, and the next session's filter starts a fresh one.
+local watcher_token = 0
+local function start_repo_watcher()
+    if not config.watch_repo or not clink.setcoroutineinterval or watcher_started or
+        not _cache.git_dir or (_cache.git_is_remote and not config.watch_remote_repo) or
+        not on_main_thread() then
         return
     end
     watcher_started = true
-    -- created without runcoroutineuntilcomplete: clink cancels it when the
-    -- edit session ends, and the next session's filter starts a fresh one
-    arm_repo_watcher(_cache.repo_generation)
+    watcher_token = watcher_token + 1
+    local token = watcher_token
+    local co = coroutine.create(function ()
+        while watcher_started and token == watcher_token do
+            repo_watcher_probe()
+            coroutine.yield()
+        end
+    end)
+    if clink.setcoroutinename then pcall(clink.setcoroutinename, co, 'snapline watch') end
+    if not pcall(clink.setcoroutineinterval, co, config.watch_interval) then
+        watcher_started = false
+    end
 end
 
 local function git_left_prompt()
@@ -1884,14 +1869,15 @@ function pf:filter()
     -- must not start another refresh or applies would loop forever
     if _cache.git_dir and not session_refresh_started then
         session_refresh_started = true
+        ensure_status_worker()
         -- spawn git only when the cached status isn't provably fresh
         if not prompt_async_enabled() or not git_status_is_fresh() then
-            start_status_refresh()
+            request_status_refresh()
         end
     end
     start_repo_watcher()
     git_status_stale = _cache.git_dir ~= nil and
-        ((status_inflight ~= nil and status_inflight.git_dir == _cache.git_dir) or
+        ((collecting ~= nil and collecting.git_dir == _cache.git_dir) or
          refresh_pending or _cache.git_status_failed)
 
     local dir_color = config.color.reset
