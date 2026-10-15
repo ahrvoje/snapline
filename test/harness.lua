@@ -73,7 +73,7 @@ local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
             raise = false, stash_count = 2, config_value = '',
             errorlevel = 0, aliases = {}, env = {}, async = true,
             remote = false, remote_path = nil, clock_step = 0,
-            registration_fail = false, status_eof = false, clock_hook = nil }
+            registration_fail = false, close_hook = nil }
 local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
@@ -174,10 +174,7 @@ io.popenyield = function (cmd)
                 coroutine.yield()
             end
             if mode == '*l' then
-                if pos > #out then
-                    if cmd:find('status --porcelain', 1, true) then P.status_eof = true end
-                    return nil
-                end
+                if pos > #out then return nil end
                 local nl = out:find('\n', pos, true)
                 local line
                 if nl then
@@ -192,7 +189,16 @@ io.popenyield = function (cmd)
         close = function () return not P.fail end,
         seek = function () return 0 end,
     }
-    return file, function () return not P.fail end
+    return file, function ()
+        -- close_hook mutates the repo the instant git exits, before snapline
+        -- can take its after-signature
+        if P.close_hook and cmd:find('status --porcelain', 1, true) then
+            local hook = P.close_hook
+            P.close_hook = nil
+            hook()
+        end
+        return not P.fail
+    end
 end
 
 os.getcwd = function () return CWD.path end
@@ -211,11 +217,6 @@ end
 os.clock = function ()
     local value = NOW
     NOW = NOW + P.clock_step
-    if P.status_eof and P.clock_hook then
-        local hook = P.clock_hook
-        P.clock_hook, P.status_eof = nil, false
-        hook()
-    end
     return value
 end
 
@@ -282,7 +283,7 @@ local function load_snapline(overrides)
     P.fail, P.slow, P.raise, P.stash_count = false, false, false, 2
     P.config_value, P.errorlevel, P.aliases, P.env = '', 0, {}, {}
     P.async, P.remote, P.remote_path, P.clock_step = true, false, nil, 0
-    P.registration_fail, P.status_eof, P.clock_hook = false, false, nil
+    P.registration_fail, P.close_hook = false, nil
     CWD.path = 'C:\\work\\proj'
     NOW = 1000
     dofile(SNAPLINE)
@@ -899,12 +900,11 @@ local transactional_calls = P.calls
 P.porcelain = PORC_STAGED
 endedit('git add transactional')
 beginedit(); H.pf:filter()
-P.status_eof = false
-P.clock_hook = function ()
+P.close_hook = function ()
     local f = assert(io.open(REPO_GD .. '\\index', 'ab'))
     f:write('t'); f:close()
 end
-tick()  -- post-status mutation rejects the first result; the worker retries at once
+tick()  -- mutation right after git exits rejects the first result; the worker retries at once
 H.pf:filter()
 check(P.calls == transactional_calls + 2 and
       plain(H.pf:rightfilter()):find('+1', 1, true) ~= nil,
@@ -997,6 +997,32 @@ local rewritten_calls = P.calls
 endedit('dir'); beginedit(); H.pf:filter(); tick()
 check(P.calls == rewritten_calls + 1,
     'cache invalidation classifies text rewritten by earlier input filters')
+
+-- Internal errors are never swallowed: the status is marked stale and the
+-- error is printed once at the next prompt boundary, never mid-edit.
+load_snapline({ watch_repo = false })
+G.gitdir, G.branch = REPO_GD, 'main'
+P.porcelain = PORC_STAGED
+beginedit(); H.pf:filter(); tick(); H.pf:filter()
+local real_getcommondir = git.getcommondir
+git.getcommondir = function () error('simulated internal failure') end
+local error_printed = #H.printed
+endedit('git add boom'); beginedit(); H.pf:filter(); tick(); H.pf:filter()
+check(color_at(H.pf:rightfilter(), '+1') == DIM_SGR and #H.printed == error_printed,
+    'internal error leaves the status dimmed and prints nothing mid-edit')
+git.getcommondir = real_getcommondir
+endedit(''); beginedit()
+local error_text = table.concat(H.printed, '\n', error_printed + 1)
+check(error_text:find('simulated internal failure', 1, true) ~= nil,
+    'internal error is reported once at the next prompt boundary')
+H.pf:filter(); tick(); H.pf:filter()
+check(color_at(H.pf:rightfilter(), '+1') == DIRTY_SGR, 'status recovers after an internal error')
+
+load_snapline(nil)
+P.env.PYENV_VERSION = 'pypy3.10-7.3.12'
+beginedit(); H.pf:filter()
+check(plain(H.pf:rightfilter()):find('py3.10:pyenv', 1, true) ~= nil,
+    'python version is the first major.minor in a version string')
 
 -- Regression for "coroutine failed: cannot resume dead coroutine": creating
 -- a coroutine from inside a scheduled coroutine mutates clink's registry

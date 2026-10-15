@@ -19,6 +19,7 @@ Prompt theme for Windows+cmd+[Clink](https://github.com/chrisant996/clink) rende
   * Async status runs with ```--no-optional-locks``` so it never takes ```index.lock``` and never collides with git commands typed at the prompt.
   * Stash count is collected by the existing async porcelain status process; no synchronous stash probe or extra process is needed.
   * One-time hint to enable ```core.fsmonitor``` when git status is repeatedly slow.
+  * An internal error never breaks the prompt: the status stays dimmed and the error is printed once at the next prompt boundary.
   * Benchmark of Clink methods, and alternative implementations; red are only called async.
     Type ```snapline-bench``` at the prompt to re-measure on your machine.
     <img src="resources/clink_benchmark.png" width="640" style="margin-left: 50px">
