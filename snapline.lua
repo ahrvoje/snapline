@@ -1,8 +1,8 @@
 -- snapline - fast async git status prompt renderer for clink
 --         by Hrvoje Abraham ahrvoje@gmail.com
 
--- Legend:  conflicted=' |N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?'
---            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??'     stashed=' ≡N'  renamed=' »N'
+-- Legend:  conflicted=' 󱐋N'      ahead=' ⇡N'   behind=' ⇣N'   diverged=' ⇕⇡A⇣B'   tracked=' ?N'
+--            modified=' !N'     staged=' +N'  deleted=' XN'  untracked=' ??N'    stashed=' ≡N'  renamed=' »N'
 --          '⇡?' upstream set but ahead/behind unknown (upstream gone or ahead_behind=false)
 --          '…' first status for this repo is still collecting     '~Nd' time since last fetch
 --          '≥N' status entry limit reached (shown counts are lower bounds)
@@ -614,21 +614,20 @@ end
 -- ===== git status via a single porcelain=v2 run =====
 -- potentially slow subprocess in the focus of the entire story!
 --
--- typical benchmark times for a single call ('snapline-bench' to re-measure)
---         no-repo dir                 repo dir
+-- Measured 2026-10-17 in this repo (12 tracked files), Windows build 26200,
+-- i9-13900K, Clink 1.9.34, Git 2.45.1.windows.1; default Snapline config.
+-- Mean per call after one warmup; 1000 render/metadata calls, 25 Git calls.
+-- These are local sample results, not latency limits. Run 'snapline-bench'
+-- to re-measure; the full capture is in resources/benchmark.txt.
 --
---         getaction   71µs            getaction   53µs
---         getgitdir   71µs            getgitdir   8µs
---          hasstash   74ms             hasstash   77ms   !!!
---    getaheadbehind   76ms       getaheadbehind   78ms   !!!
---         getremote   71µs            getremote   27µs
---          isgitdir   23µs             isgitdir   8µs
---         getbranch   70µs            getbranch   22µs
---     getstashcount   73ms        getstashcount   75ms   !!!
---      getcommondir   71µs         getcommondir   14µs
---         getstatus   69µs            getstatus   86ms   !!!
--- getconflictstatus   76ms    getconflictstatus   81ms   !!!
---     getsystemname   71µs        getsystemname   9µs
+-- cached left + right       18µs   (no Git process)
+-- collect_status full       36ms   (one async Git process in normal use)
+-- collect_status reuse      35ms   (same process, cached untracked count)
+--
+-- Clink metadata: getgitdir/isgitdir/getsystemname 22µs, getcommondir 36µs,
+--                getbranch 48µs, getremote 63µs, getaction 148µs.
+-- Clink subprocesses: hasstash 32ms, getstashcount/getconflictstatus 33ms,
+--                     getaheadbehind/getstatus 35ms.
 
 local function should_scan_untracked(status)
     local interval = config.untracked_refresh_interval
@@ -1489,6 +1488,7 @@ end
 -- benchmark Clink git API calls and snapline alternatives; typed as the
 -- 'snapline-bench' command at the prompt (runs blocking, a few seconds)
 local function time_loop(f, n)
+    f() -- warm filesystem and command caches before measuring
     local t = clock()
     for _ = 1, n do
         f()
@@ -1497,9 +1497,22 @@ local function time_loop(f, n)
 end
 
 local function run_bench()
-    local n = 5
-    clink.print(config.color.took .. format('snapline bench: %d iterations per call, slow calls red', n) .. config.color.reset)
-    local rows = {
+    clink.print(config.color.took .. 'snapline bench: mean per call after 1 warmup; red >10ms' .. config.color.reset)
+    local function measure(title, n, rows)
+        clink.print(config.color.took .. format('%s (%d calls)', title, n) .. config.color.reset)
+        for i = 1, #rows do
+            local name, fn = rows[i][1], rows[i][2]
+            if fn then
+                local duration = time_loop(fn, n)
+                local color = duration > 0.01 and config.color.dirty or config.color.clean
+                clink.print(color .. format('%32s', name) .. '   ' .. fmt_duration(duration) .. config.color.reset)
+            end
+        end
+    end
+    measure('cached prompt', 1000, {
+        {'snapline left + right', function () pf:filter(); pf:rightfilter() end},
+    })
+    measure('Clink metadata', 1000, {
         {'git.getaction',           git.getaction},
         {'git.getgitdir',           git.getgitdir},
         {'git.getcommondir',        git.getcommondir},
@@ -1507,22 +1520,27 @@ local function run_bench()
         {'git.getremote',           git.getremote},
         {'git.isgitdir',            git.isgitdir},
         {'git.getsystemname',       git.getsystemname},
+    })
+    measure('Clink subprocess calls', 25, {
         {'git.hasstash',            git.hasstash},
         {'git.getstashcount',       git.getstashcount},
         {'git.getaheadbehind',      git.getaheadbehind},
         {'git.getstatus',           git.getstatus},
         {'git.getconflictstatus',   git.getconflictstatus},
-        {'snapline collect_status', function ()
-            return collect_status(cache.repo and cache.repo.status or new_status())
+    })
+    measure('Snapline async collection (timed synchronously here)', 25, {
+        {'collect_status (full scan)', function ()
+            return collect_status(new_status())
         end},
-    }
-    for i = 1, #rows do
-        local name, fn = rows[i][1], rows[i][2]
-        if fn then
-            local duration = time_loop(fn, n)
-            local color = duration > 0.01 and config.color.dirty or config.color.clean
-            clink.print(color .. format('%25s', name) .. '   ' .. fmt_duration(duration) .. config.color.reset)
-        end
+    })
+    if config.untracked_refresh_interval and config.untracked_refresh_interval > 0 then
+        local status = new_status()
+        measure('Snapline async collection (reuse untracked count)', 25, {
+            {'collect_status (reuse count)', function ()
+                status.untracked_at = clock()
+                return collect_status(status)
+            end},
+        })
     end
 end
 

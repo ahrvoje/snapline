@@ -659,12 +659,31 @@ check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
 
 -- T12 snapline-bench consumes the input line
 local before_bench = #H.printed
+local bench_commands, bench_popenyield = {}, io.popenyield
+local before_bench_right = H.pf:rightfilter()
+io.popenyield = function (cmd)
+    bench_commands[#bench_commands + 1] = cmd
+    return bench_popenyield(cmd)
+end
 local replaced = endedit('snapline-bench')
+io.popenyield = bench_popenyield
 check(replaced == '', 'snapline-bench replaced with empty command line')
 check(H.filter_stopped, 'snapline-bench prevents later input filters from rewriting it')
 local bench_out = table.concat(H.printed, '\n', before_bench + 1)
 check(bench_out:find('snapline bench', 1, true) ~= nil, 'bench printed results')
 check(bench_out:find('collect_status', 1, true) ~= nil, 'bench included snapline alternatives')
+check(bench_out:find('snapline left + right', 1, true) ~= nil,
+    'bench separates cached prompt rendering from status collection')
+check(#bench_commands == 52, 'bench runs 25 measured collections plus one warmup per scan mode')
+local full_scans, reused_scans = 0, 0
+for i = 1, #bench_commands do
+    if bench_commands[i]:find('--untracked-files=normal ', 1, true) then full_scans = full_scans + 1 end
+    if bench_commands[i]:find('--untracked-files=no ', 1, true) then reused_scans = reused_scans + 1 end
+end
+check(full_scans == 26 and reused_scans == 26, 'bench measures full scans and untracked-count reuse separately')
+check(plain(H.pf:rightfilter()):gsub('%d%d:%d%d:%d%d', '') ==
+      plain(before_bench_right):gsub('%d%d:%d%d:%d%d', ''),
+    'bench does not replace the cached status with measured results')
 
 -- T13 snapline-legend prints the configured glyphs
 local before_legend = #H.printed
