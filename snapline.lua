@@ -323,21 +323,17 @@ local function file_stamp(p)
     return item and ((item.size or 0) .. ':' .. (item.mtime or 0)) or '-'
 end
 
--- Content identity for small Git state files, or nil when unreadable.  For
+-- Content identity for small Git state files, or '-' when unreadable.  For
 -- large files only the tail is needed: Git's index ends in an object
 -- checksum, stash updates affect the last reflog entry, and reftable stack
 -- updates affect tables.list's tail.
-local function file_fingerprint(p, tail_bytes)
+local function file_sample(p, tail_bytes)
     local f = io.open(p, 'rb')
-    if not f then return nil end
+    if not f then return '-' end
     local size = f:seek('end')
     local content = size and f:seek('set', size > tail_bytes and size - tail_bytes or 0) and f:read('*a')
     f:close()
-    return content and (size .. ':' .. content) or nil
-end
-
-local function file_sample(p, tail_bytes)
-    return file_fingerprint(p, tail_bytes) or '-'
+    return content and (size .. ':' .. content) or '-'
 end
 
 local function fmt_duration(s)
@@ -928,7 +924,7 @@ end
 -- applied only when the state version it started with is still current.
 local worker = nil               -- perpetual collector coroutine, nil until needed
 local worker_kept = false        -- registered untilcomplete, so it survives edit-session ends
-local inflight = nil             -- { repo, version } while a collection runs
+local inflight = nil             -- { repo, version, before } while a collection runs
 local refresh_pending = false    -- newest state still needs a collection
 local WORKER_IDLE_INTERVAL = 3600   -- parked; requests wake the worker via interval 0
 
@@ -953,6 +949,11 @@ local function refilter()
     if not ok then report_error(err) end
 end
 
+-- true while a collection of exactly the current state is running
+local function collecting(repo)
+    return inflight ~= nil and inflight.repo == repo and inflight.version == state_version
+end
+
 -- Ask for a status refresh of the current state.  Callable from any context:
 -- it never creates a coroutine, it only marks work pending and wakes the
 -- parked worker.
@@ -970,8 +971,7 @@ local function request_refresh()
         return
     end
     status.unavailable = nil
-    if inflight and inflight.repo == repo and inflight.version == state_version then
-        -- a collection for exactly this state is already running
+    if collecting(repo) then
         refresh_pending = false
         return
     end
@@ -1013,12 +1013,14 @@ end
 -- and the result is rejected when its inputs changed meanwhile.  An identity
 -- change consumes one attempt, an unstable repository another; nothing is
 -- committed unless a final signature still describes the collected status.
-local function collect_stable(repo, version)
+local function collect_stable(job)
+    local repo, version = job.repo, job.version
     local started = clock()
     local ctx = repo_context(repo)
     local response = { cwd = os.getcwd() }
     for _ = 1, 3 do
         local before = signature(ctx)
+        job.before = before
         local info, observed = collect_status(repo.status)
         response.info, response.observed = info, observed
         if not info then break end
@@ -1088,8 +1090,8 @@ end
 
 local function run_collection()
     local repo, version = cache.repo, state_version
-    inflight = { repo = repo, version = version }
-    local ok, response = pcall(collect_stable, repo, version)
+    inflight = { repo = repo, version = version, before = nil }
+    local ok, response = pcall(collect_stable, inflight)
     inflight = nil
     if version ~= state_version or repo ~= cache.repo or repo.status.unavailable then
         -- Superseded mid-collection: the result describes a state that no
@@ -1102,12 +1104,13 @@ local function run_collection()
         -- 'applied' holds the apply error, 'response' the collect error
         repo.status.failed = true
         report_error(applied or response)
-    elseif applied then
-        -- may yield for one async config read; the status is already committed
+    end
+    refilter()
+    if ok and applied then
+        -- may yield for one async config read, so it runs after the redraw
         local hint_ok, err = pcall(check_fsmonitor_hint, repo, response.duration)
         if not hint_ok then report_error(err) end
     end
-    refilter()
 end
 
 local function worker_loop()
@@ -1159,7 +1162,13 @@ local function watcher_probe()
     end
     if same_signature(sig, base) then return end
     status.baseline = sig
-    state_version = state_version + 1
+    -- The first probe of a session usually sees what the command just run
+    -- changed, while the refresh requested for that command is already
+    -- collecting from this very state.  Superseding it would discard a valid
+    -- result and run git a second time.
+    if not (collecting(repo) and inflight.before and same_signature(sig, inflight.before)) then
+        state_version = state_version + 1
+    end
     if sig.identity ~= base.identity then repo.identity_stale = true end
     if sig.work ~= base.work then status.untracked_at = nil end
     status.at = nil

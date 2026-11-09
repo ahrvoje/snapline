@@ -657,6 +657,24 @@ pright = plain(right)
 check(pright:find('⇡', 1, true) == nil and pright:find('+1', 1, true) ~= nil,
     'abandoned pre-push data not applied, status neutral')
 
+-- T11d the first watcher probe of a session sees what the command just run
+-- changed, while the refresh requested for that command is already collecting
+-- from that same state: superseding it would run git twice
+tick()
+P.slow = true
+fh = io.open(REPO_GD .. '\\index', 'ab')
+fh:write('z'); fh:close()
+local c11d = P.calls
+endedit('git commit -m x')
+beginedit(); H.pf:filter()
+tick()  -- collection starts and yields mid-read; the new watcher sees the commit
+tick()  -- collection completes and applies
+tick()
+check(P.calls == c11d + 1, 'watcher does not supersede a collection that already covers its change')
+H.pf:filter()
+check(color_at(H.pf:rightfilter(), '+1') == DIRTY_SGR, 'covered collection applied on its first run')
+P.slow = false
+
 -- T12 snapline-bench consumes the input line
 local before_bench = #H.printed
 local bench_commands, bench_popenyield = {}, io.popenyield
