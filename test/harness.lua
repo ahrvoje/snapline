@@ -73,18 +73,41 @@ local P = { calls = 0, lastcmd = '', porcelain = '', fail = false, slow = false,
             raise = false, stash_count = 2, config_value = '',
             errorlevel = 0, aliases = {}, env = {}, async = true,
             remote = false, remote_path = nil, clock_step = 0,
-            registration_fail = false, close_hook = nil }
+            registration_fail = false, close_hook = nil,
+            chdir_fail = false, lastcwd = nil }
 local CWD = { path = 'C:\\work\\proj' }
 local NOW = 1000
 
-local real_create = coroutine.create
+-- Clink gives every coroutine its own working directory: captured at
+-- creation, restored on each resume, saved again at each yield.  A long-lived
+-- coroutine therefore never follows the prompt's cwd by itself.
+local co_cwd = setmetatable({}, { __mode = 'k' })
+local real_create, real_resume = coroutine.create, coroutine.resume
 local creates_inside_co = 0
 coroutine.create = function (f)
     local _, is_main = coroutine.running()
     if not is_main then creates_inside_co = creates_inside_co + 1 end
     local co = real_create(f)
+    co_cwd[co] = CWD.path
     if H then H.cos[#H.cos + 1] = co end
     return co
+end
+coroutine.resume = function (co, ...)
+    local outer = CWD.path
+    CWD.path = co_cwd[co] or outer
+    local result = table.pack(real_resume(co, ...))
+    co_cwd[co], CWD.path = CWD.path, outer
+    return table.unpack(result, 1, result.n)
+end
+
+-- G.repos, when set, maps a worktree root to { gitdir, branch, porcelain } and
+-- makes the git stub resolve the repository from the current directory, like
+-- real git does.  Otherwise the single G.gitdir repo answers everywhere.
+local function repo_at(dir)
+    while dir do
+        if G.repos[dir] then return G.repos[dir], dir end
+        dir = dir:match('^(.*)\\[^\\]+$')
+    end
 end
 
 local function make_clink_stub()
@@ -126,11 +149,26 @@ local function make_git_stub()
     return {
         getgitdir = function ()
             G.gitdir_calls = (G.gitdir_calls or 0) + 1
+            if G.repos then
+                local repo, root = repo_at(CWD.path)
+                if repo then return repo.gitdir, repo.gitdir, root end
+                return nil
+            end
             return G.gitdir, G.workspace_dir or G.gitdir, G.root or CWD.path
         end,
-        getcommondir = function () return G.commondir or G.gitdir end,
+        getcommondir = function ()
+            if G.repos then
+                local repo = repo_at(CWD.path)
+                return repo and repo.gitdir
+            end
+            return G.commondir or G.gitdir
+        end,
         getbranch = function (git_dir, fast)
             G.branch_git_dir, G.branch_fast = git_dir, fast
+            if G.repos then
+                local repo = repo_at(CWD.path)
+                return repo and repo.branch
+            end
             return G.branch
         end,
         getaction = function () return G.action, G.action_step, G.action_total end,
@@ -149,10 +187,12 @@ end
 io.popenyield = function (cmd)
     P.calls = P.calls + 1
     P.lastcmd = cmd
+    P.lastcwd = CWD.path  -- a child process inherits the cwd in effect at spawn
     local out = ''
     if cmd:find('status --porcelain', 1, true) then
         local lines = {}
-        for line in P.porcelain:gmatch('[^\r\n]+') do
+        local repo = G.repos and repo_at(CWD.path)
+        for line in (repo and repo.porcelain or P.porcelain):gmatch('[^\r\n]+') do
             if not (cmd:find('--untracked-files=no ', 1, true) and line:sub(1, 1) == '?') then
                 lines[#lines + 1] = line
             end
@@ -202,6 +242,11 @@ io.popenyield = function (cmd)
 end
 
 os.getcwd = function () return CWD.path end
+os.chdir = function (path)
+    if P.chdir_fail then return false end
+    CWD.path = path
+    return true
+end
 os.getenv = function (name) return P.env[name] end
 os.geterrorlevel = function () return P.errorlevel end
 os.getaliases = function () return P.aliases end
@@ -275,7 +320,7 @@ local function load_snapline(overrides)
         if name == 'prompt.async' then return P.async end
     end })
     G.gitdir, G.branch, G.action, G.commondir = nil, nil, nil, nil
-    G.workspace_dir, G.root = nil, nil
+    G.workspace_dir, G.root, G.repos = nil, nil, nil
     G.action_step, G.action_total = nil, nil
     G.branch_git_dir, G.branch_fast = nil, nil
     G.gitdir_calls = 0
@@ -284,6 +329,7 @@ local function load_snapline(overrides)
     P.config_value, P.errorlevel, P.aliases, P.env = '', 0, {}, {}
     P.async, P.remote, P.remote_path, P.clock_step = true, false, nil, 0
     P.registration_fail, P.close_hook = false, nil
+    P.chdir_fail, P.lastcwd = false, nil
     CWD.path = 'C:\\work\\proj'
     NOW = 1000
     dofile(SNAPLINE)
@@ -1060,6 +1106,140 @@ P.env.PYENV_VERSION = 'pypy3.10-7.3.12'
 beginedit(); H.pf:filter()
 check(plain(H.pf:rightfilter()):find('py3.10:pyenv', 1, true) ~= nil,
     'python version is the first major.minor in a version string')
+
+-- =====================================================================
+print('===== suite 9: repository switches and the per-coroutine working directory =====')
+-- The status worker is created in the first repository and lives for the
+-- whole session.  Clink restores a coroutine's own cwd on every resume, so
+-- the worker must follow the prompt or it reports the first repository's
+-- status for every other one.
+local ONE, TWO, PLAIN = 'C:\\work\\one', 'C:\\work\\two', 'C:\\work\\plain'
+local REPO2_GD = HERE .. 'fakerepo\\two\\.git'
+os.execute('cmd /c mkdir "' .. REPO2_GD .. '" 2>nul')
+write_fixture(REPO2_GD .. '\\index', 'DIRC second index')
+write_fixture(REPO2_GD .. '\\HEAD', 'ref: refs/heads/main\n')
+local PORC_BEHIND = (PORC_CLEAN:gsub('%+0 %-0', '+0 -1'))
+
+-- repo one is one commit behind, repo two is up to date, same branch name
+local function load_two_repos(overrides)
+    load_snapline(overrides)
+    G.repos = {
+        [ONE] = { gitdir = REPO_GD, branch = 'main', porcelain = PORC_BEHIND },
+        [TWO] = { gitdir = REPO2_GD, branch = 'main', porcelain = PORC_CLEAN },
+    }
+    P.stash_count = 0
+    CWD.path = ONE
+end
+-- submit a line that leaves the shell in cwd, then render the next prompt
+local function enter(line, cwd)
+    endedit(line)
+    CWD.path = cwd or CWD.path
+    beginedit()
+    H.pf:filter()
+    return plain(H.pf:rightfilter())
+end
+local function settled()
+    tick(); tick(); tick()
+    H.pf:filter()
+    return plain(H.pf:rightfilter())
+end
+local function has(s, glyph)
+    return s:find(glyph, 1, true) ~= nil
+end
+
+-- the reported bug: behind arrow of repo one shown in up-to-date repo two
+load_two_repos(nil)
+beginedit(); H.pf:filter()
+check(has(settled(), '⇣1') and P.lastcwd == ONE, 'first repository shows its behind count')
+local switch_calls = P.calls
+right = enter('cd ..\\two', TWO)
+check(not has(right, '⇣') and has(right, '…'),
+    'switching repositories carries no status over, the new one is pending')
+right = settled()
+check(not has(right, '⇣') and not has(right, '…'),
+    'up-to-date repository shows no behind arrow after leaving a repository that is behind')
+check(P.lastcwd == TWO, 'status of the new repository is collected in its own folder')
+check(P.calls == switch_calls + 1, 'a repository switch runs git exactly once')
+check(has(plain(H.pf:filter()), 'two > '), 'left prompt shows the new folder')
+enter('cd ..\\one', ONE)
+check(has(settled(), '⇣1') and P.lastcwd == ONE,
+    'returning to the first repository collects its own status again')
+
+-- the worker stays parked while outside any repository
+local plain_calls = P.calls
+right = enter('cd ..\\plain', PLAIN)
+tick()
+check(not has(right, '⇣') and P.calls == plain_calls, 'leaving for a plain folder shows no status and runs no git')
+enter('cd ..\\two', TWO)
+check(not has(settled(), '⇣') and P.lastcwd == TWO,
+    'entering another repository from a plain folder collects that repository')
+
+-- external change in the second repository: the watcher triggers a refresh
+-- that must also run there
+G.repos[TWO].porcelain = PORC_STAGED
+fh = io.open(REPO2_GD .. '\\index', 'ab')
+fh:write('w'); fh:close()
+local watch_calls = P.calls
+check(has(settled(), '+1') and P.calls == watch_calls + 1 and P.lastcwd == TWO,
+    'watcher-triggered refresh runs in the current repository')
+
+-- a collection still running in repo one when the prompt moves to repo two
+load_two_repos(nil)
+beginedit(); H.pf:filter(); settled()
+P.slow = true
+enter('git fetch', ONE)
+tick()  -- collection in repo one spawns git and yields mid-read
+right = enter('cd ..\\two', TWO)
+tick()  -- repo one result completes and is dropped; repo two starts and yields
+H.pf:filter()
+check(not has(right, '⇣') and not has(plain(H.pf:rightfilter()), '⇣'),
+    'in-flight result of the previous repository is never shown in the next one')
+P.slow = false
+check(not has(settled(), '⇣') and P.lastcwd == TWO,
+    'the next repository is collected after the stale in-flight result is dropped')
+
+-- cd to a subfolder of the same repository while its collection is running:
+-- status is repo-wide, so the one running collection still applies
+load_two_repos(nil)
+beginedit(); H.pf:filter(); settled()
+P.slow = true
+local sub_calls = P.calls
+enter('git fetch', ONE)
+tick()
+enter('cd sub', ONE .. '\\sub')
+check(has(settled(), '⇣1') and P.calls == sub_calls + 1,
+    'cd inside a repository keeps the collection that is already running')
+P.slow = false
+enter('git fetch')
+check(has(settled(), '⇣1') and P.lastcwd == ONE .. '\\sub',
+    'the worker follows the prompt into a subfolder')
+
+-- the worker cannot enter the prompt folder: no git in a foreign folder, no
+-- foreign status adopted, visible pending state, recovery on the next prompt
+load_two_repos(nil)
+beginedit(); H.pf:filter(); settled()
+P.chdir_fail = true
+local stuck_calls = P.calls
+enter('cd ..\\two', TWO)
+right = settled()
+check(P.calls == stuck_calls, 'no git runs when the worker cannot enter the prompt folder')
+check(not has(right, '⇣') and has(right, '…') and color_at(H.pf:rightfilter(), '…') == DIM_SGR,
+    'unreachable folder leaves the status pending instead of adopting another repository')
+P.chdir_fail = false
+enter('')
+right = settled()
+check(P.calls == stuck_calls + 1 and P.lastcwd == TWO and not has(right, '⇣') and not has(right, '…'),
+    'status recovers on the next prompt once the folder is reachable')
+
+-- the fsmonitor config read is a second git process: it must also run in the
+-- current repository
+load_two_repos({ fsmonitor_hint_threshold = 0, fsmonitor_hint_count = 1 })
+P.config_value = 'true\n'
+beginedit(); H.pf:filter(); settled()
+enter('cd ..\\two', TWO)
+settled()
+check(has(P.lastcmd, 'config --get core.fsmonitor') and P.lastcwd == TWO,
+    'fsmonitor config is read from the current repository')
 
 -- Regression for "coroutine failed: cannot resume dead coroutine": creating
 -- a coroutine from inside a scheduled coroutine mutates clink's registry

@@ -21,7 +21,7 @@ if not (clink and git and settings and console and io.popenyield and os.findfile
     and clink.onfilterinput and clink.getclinkprompt and clink.runcoroutineuntilcomplete
     and clink.setcoroutineinterval and clink.setcoroutinename
     and git.getgitdir and git.getcommondir and git.getbranch and git.getaction and git.makecommand
-    and os.getdrivetype and os.geterrorlevel and os.getalias and os.isfile
+    and os.getdrivetype and os.geterrorlevel and os.getalias and os.isfile and os.chdir
     and console.cellcount and console.getwidth) then
     return
 end
@@ -1017,7 +1017,12 @@ local function collect_stable(job)
     local repo, version = job.repo, job.version
     local started = clock()
     local ctx = repo_context(repo)
-    local response = { cwd = os.getcwd() }
+    -- Clink gives every coroutine its own working directory and restores it
+    -- on each resume.  Left alone, this perpetual worker would keep running
+    -- git in the folder where it was created and report that repository for
+    -- every other one, so it follows the prompt before each collection.
+    local response = { cwd = cache.cwd }
+    if not os.chdir(response.cwd) then return response end
     for _ = 1, 3 do
         local before = signature(ctx)
         job.before = before
@@ -1057,7 +1062,7 @@ local function apply_status(repo, response)
     end
     if info.key ~= repo.key then
         -- the repository under this cwd was replaced, e.g. .git recreated
-        if not paths_equal(os.getcwd(), response.cwd) or
+        if not paths_equal(cache.cwd, response.cwd) or
             (not config.enable_remote_repos and any_remote(info.git_dir, info.common_dir)) then
             repo.identity_stale = true
             return false
